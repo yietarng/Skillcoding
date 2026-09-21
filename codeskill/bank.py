@@ -173,6 +173,23 @@ class SkillBank:
         scored.sort(key=lambda r: r.score, reverse=True)
         return scored[:top_k]
 
+    def retrieve_similar(
+        self,
+        skill: Skill,
+        top_k: int = 5,
+        exclude_trajectory_ids: Optional[set[str]] = None,
+    ) -> list[RetrievalResult]:
+        """Like `retrieve`, but queries with a *skill's* own full content
+        (title + when_to_apply + rules) rather than a bare query string --
+        the same document construction Appendix C describes for indexed
+        skills, applied symmetrically to the query side. This is what
+        maintenance (Fig 9) should use to find "retrieved similar skills"
+        for a candidate: matching on the candidate's full content, not just
+        its `when_to_apply`.
+        """
+        query = " ".join([skill.title, skill.when_to_apply, *skill.rules])
+        return self.retrieve(query, top_k=top_k, granularity=skill.granularity, exclude_trajectory_ids=exclude_trajectory_ids)
+
     # -- compaction -------------------------------------------------------
 
     def compact(self, min_uses: int = 3, min_success_rate: float = 0.2) -> list[str]:

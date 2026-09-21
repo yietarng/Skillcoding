@@ -2,10 +2,19 @@
 
 At inference time this is "extract or evolve, then maintain": an
 extraction (Fig 6/7) or evolution (Fig 8) call proposes a candidate skill,
-and -- for extraction only -- a maintenance call (Fig 9) decides how it
-enters the bank (add/merge/drop) by comparing it against retrieved similar
-skills. Evolution instead revises a specific existing skill directly (no
-separate maintenance step -- Fig 8's `evolve` already names its target).
+and a maintenance call (Fig 9) decides how it enters the bank
+(add/merge/drop) by comparing it against retrieved similar skills. The
+paper is explicit that this applies to *both* sources -- "each newly
+extracted or evolved candidate skill is further passed to a maintenance
+stage" (Section 3.2, repeated in Appendix C) -- so `process_evolution`
+below routes its revised candidate through the same `_maintain` step as
+extraction, rather than writing the revision straight to the bank.
+
+For an evolution-sourced candidate, maintenance's `add` decision commits
+the revision (replacing the skill the evolver named as its target);
+`merge` still means "fold into whichever retrieved skill the maintainer
+chose" (which may or may not be that same target); `drop` rejects the
+revision and leaves the target unchanged.
 
 During RL training (see `codeskill.grpo`), it's these same LLM calls whose
 *proposals* are sampled, scored by the hybrid reward, and optimized -- the
@@ -71,16 +80,31 @@ class SkillManagerPolicy:
             retrieval_top_k=retrieval_top_k,
         )
 
-    def _maintain(self, candidate: Skill) -> list[StageOutcome]:
+    def _maintain(self, candidate: Skill, *, replace_target_id: Optional[str] = None) -> list[StageOutcome]:
+        """Runs the maintenance decision (Fig 9) for `candidate`.
+
+        `replace_target_id`, when set, marks this candidate as an
+        evolution's revision rather than a fresh extraction: an `add`
+        decision then commits the revision onto that target (via
+        `bank.replace`) instead of inserting a brand-new skill, and a
+        `drop` decision is reported as keeping the target unchanged rather
+        than as rejecting a would-be-new skill.
+        """
         if self.maintainer is None:
             raise ValueError("no SkillMaintainer configured")
-        retrieved = [
-            r.skill
-            for r in self.bank.retrieve(candidate.when_to_apply, top_k=self.retrieval_top_k, granularity=candidate.granularity)
-        ]
+        retrieved = [r.skill for r in self.bank.retrieve_similar(candidate, top_k=self.retrieval_top_k)]
         decision = self.maintainer.decide(candidate, retrieved)
 
         if decision.decision == Decision.ADD:
+            if replace_target_id is not None:
+                if self.bank.get(replace_target_id) is None:
+                    return [StageOutcome("maintain_add", f"invalid_replace_target:{replace_target_id}", applied=False)]
+                self.bank.replace(replace_target_id, candidate, rationale=decision.reason)
+                return [
+                    StageOutcome(
+                        "maintain_add", f"committed_revision:{replace_target_id}", applied=True, skill_id=replace_target_id
+                    )
+                ]
             accepted, reason = self.bank.add(candidate)
             return [
                 StageOutcome(
@@ -106,7 +130,10 @@ class SkillManagerPolicy:
             ]
 
         # DROP (or a malformed response, which parse_maintenance_response also maps to DROP)
-        return [StageOutcome("maintain_drop", decision.reason or "dropped_candidate", applied=False)]
+        detail = decision.reason or "dropped_candidate"
+        if replace_target_id is not None:
+            detail = f"kept_existing_unchanged:{replace_target_id} ({detail})"
+        return [StageOutcome("maintain_drop", detail, applied=False)]
 
     def process_event_trajectory(self, trajectory: Trajectory) -> list[StageOutcome]:
         outcome = self.event_extractor.propose(trajectory)
@@ -130,8 +157,8 @@ class SkillManagerPolicy:
             return [StageOutcome("evolve", outcome.reason or "skip", applied=False)]
         if self.bank.get(outcome.target_skill_id) is None:
             return [StageOutcome("evolve", f"invalid_target:{outcome.target_skill_id}", applied=False)]
-        self.bank.replace(outcome.target_skill_id, outcome.skill, rationale=outcome.reason)
-        return [StageOutcome("evolve", f"evolved:{outcome.target_skill_id}", applied=True, skill_id=outcome.target_skill_id)]
+        proposed = StageOutcome("evolve", "revised candidate", applied=True, skill_id=outcome.target_skill_id)
+        return [proposed] + self._maintain(outcome.skill, replace_target_id=outcome.target_skill_id)
 
     def run_round(
         self,

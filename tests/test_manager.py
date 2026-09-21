@@ -144,6 +144,12 @@ def test_process_evolution_replaces_target_skill():
             }
         ),
     )
+    # Per the paper, evolved candidates also pass through maintenance
+    # (Section 3.2 / Appendix C): "add" here means committing the revision.
+    llm.register(
+        lambda system, prompt: system == SKILL_MAINTENANCE_SYSTEM_PROMPT,
+        lambda system, prompt: json.dumps({"action": "add", "reason": "revision accepted"}),
+    )
     manager = SkillManagerPolicy(
         bank=bank,
         event_extractor=EventSkillExtractor(llm),
@@ -153,11 +159,58 @@ def test_process_evolution_replaces_target_skill():
 
     outcomes = manager.process_evolution([existing], make_trajectory())
 
-    assert outcomes[0].stage == "evolve"
-    assert outcomes[0].applied is True
+    assert [o.stage for o in outcomes] == ["evolve", "maintain_add"]
+    assert all(o.applied for o in outcomes)
     updated = bank.get(existing.id)
     assert "verify with pip show requests" in updated.rules
     assert updated.version == 2
+
+
+def test_process_evolution_maintenance_drop_keeps_target_unchanged():
+    bank = SkillBank()
+    existing = Skill(
+        title="install requests",
+        granularity=Granularity.EVENT_DRIVEN,
+        when_to_apply="ModuleNotFoundError for requests",
+        rules=["pip install requests"],
+    )
+    bank.add(existing)
+
+    llm = MockLLMClient()
+    llm.register(
+        lambda system, prompt: system == SKILL_EVOLUTION_SYSTEM_PROMPT,
+        lambda system, prompt: json.dumps(
+            {
+                "action": "evolve",
+                "target_skill_id": existing.id,
+                "reason": "new caution",
+                "skill": {
+                    "title": "install requests",
+                    "granularity": "event-driven",
+                    "when_to_apply": "ModuleNotFoundError for requests",
+                    "rules": ["pip install requests", "an overreaching unsupported rule"],
+                },
+            }
+        ),
+    )
+    llm.register(
+        lambda system, prompt: system == SKILL_MAINTENANCE_SYSTEM_PROMPT,
+        lambda system, prompt: json.dumps({"action": "drop", "reason": "revision not well grounded"}),
+    )
+    manager = SkillManagerPolicy(
+        bank=bank,
+        event_extractor=EventSkillExtractor(llm),
+        evolver=SkillEvolver(llm),
+        maintainer=SkillMaintainer(llm),
+    )
+
+    outcomes = manager.process_evolution([existing], make_trajectory())
+
+    assert outcomes[-1].stage == "maintain_drop"
+    assert outcomes[-1].applied is False
+    updated = bank.get(existing.id)
+    assert updated.rules == ["pip install requests"]  # unchanged
+    assert updated.version == 1
 
 
 def test_process_evolution_skip_does_not_touch_bank():

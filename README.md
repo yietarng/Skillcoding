@@ -75,30 +75,41 @@ The appendix specifies four manager-policy stages, each its own prompt --
 not one combined "extract and maintain" call:
 
 ```
-                    ┌─────────────────────┐
-2-3 related         │ TaskSkillExtractor   │  generate | skip
-trajectories ──────►│ (Fig 6)              │──┐
-                    └─────────────────────┘  │
-                                              │
-one full trajectory ┌─────────────────────┐  │  candidate Skill
-              ──────►│ EventSkillExtractor  │──┤  {title, granularity,
-                    │ (Fig 7)              │  │   when_to_apply, rules}
-                    └─────────────────────┘  │
-                                              ▼
-                                     ┌──────────────────┐        add ──► SkillBank.add
-existing skill(s) ┌───────────────┐  │ SkillMaintainer  │──────► merge ─► SkillBank.replace
-+ 1 trajectory ───►│ SkillEvolver  │  │ (Fig 9)          │        drop ──► (no-op)
-              ────►│ (Fig 8)      │  │ vs. retrieved     │
-                   └───────┬───────┘  │ similar skills   │
-                   evolve  │          └──────────────────┘
-                   (replace │
-                    target) ▼
-                       SkillBank.replace
+2-3 related          ┌────────────────────┐
+trajectories ────────►│ TaskSkillExtractor │  generate | skip
+                      │ (Fig 6)            │──┐
+                      └────────────────────┘  │
+one full trajectory   ┌────────────────────┐  │
+              ────────►│ EventSkillExtractor│──┤  candidate Skill
+                      │ (Fig 7)            │  │  {title, granularity,
+                      └────────────────────┘  │   when_to_apply, rules}
+                                               │
+existing skill(s)     ┌────────────────────┐  │
++ 1 trajectory ───────►│ SkillEvolver       │──┤  (candidate + its
+                      │ (Fig 8) -> evolve   │  │   named target_skill_id)
+                      └────────────────────┘  │
+                                               ▼
+                                      ┌───────────────────┐   add   ──► SkillBank.add,
+                                      │ SkillMaintainer    │            or SkillBank.replace(target)
+                          ┌──────────►│ (Fig 9)            │─► merge ──► SkillBank.replace(merge_target)
+                          │           │ vs. retrieved       │   drop  ──► (no-op; evolution's
+                    retrieved         │ similar skills      │            target, if any, unchanged)
+                    similar skills    └───────────────────┘
 ```
 
 - Extraction (Fig 6/7) sees only trajectories, **never the existing bank**.
 - Evolution (Fig 8) sees relevant existing skills plus one new trajectory,
-  and revises a named target directly -- no separate maintenance step.
+  and proposes a revision naming its target skill.
+- **Both extraction and evolution outputs then pass through the same
+  maintenance stage** (Fig 9) -- the paper is explicit that "each newly
+  extracted or evolved candidate skill is further passed to a maintenance
+  stage" (Section 3.2, repeated verbatim in Appendix C). An earlier version
+  of this codebase wrote evolution's revision straight to the bank,
+  skipping maintenance; `SkillManagerPolicy.process_evolution` now routes
+  it through `_maintain` like extraction does. For an evolution-sourced
+  candidate, maintenance's `add` commits the revision onto the evolver's
+  named target; `merge` may still fold it into a *different* retrieved
+  skill; `drop` leaves the target unchanged.
 - Maintenance (Fig 9) sees a candidate skill and retrieved similar skills
   but **no trajectory at all** -- the appendix (Fig 13's judge description)
   is explicit that "maintain decisions are made without a trajectory."
@@ -137,6 +148,20 @@ existing skill(s) ┌───────────────┐  │ Skill
   as two separate passes over a benchmark. The same-instance-leakage
   mechanism (`exclude_trajectory_ids`) is implemented and tested, but
   wiring the full streaming loop end-to-end is left as an exercise.
+  Relatedly, Appendix C also notes each real instance produces "about one
+  task-level skill and three event-driven skills" -- i.e. the extractor is
+  called several times per instance (presumably at nonzero sampling
+  temperature) -- while `SkillManagerPolicy.process_event_trajectory`
+  calls it once per trajectory; call it multiple times yourself if you want
+  that same multi-candidate-per-instance behavior.
+- **Retrieval timing differs by granularity in the paper**: task-level
+  skills are retrieved once before solving starts, but event-driven skills
+  are retrieved *online, mid-rollout*, re-querying with "recent reasoning,
+  executed actions, observations, error messages, command outputs" as the
+  agent proceeds (Appendix C). `FrozenDownstreamAgent` is a single-shot
+  `solve_fn` abstraction with no multi-turn rollout loop, so it can only
+  retrieve once, up front, using the initial task description for both
+  granularities -- a structural simplification, not a tunable parameter.
 - The **GRPO training loop** (`codeskill/grpo.py`) and **SFT dataset
   builder** (`codeskill/sft_data.py`) are original scaffolding built to the
   paper's *description* of warm-start SFT + GRPO with hybrid reward --

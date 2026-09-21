@@ -62,6 +62,17 @@ def test_retrieve_ranks_by_lexical_overlap():
     assert results[0].score >= results[1].score
 
 
+def test_retrieve_similar_queries_with_full_skill_content():
+    bank = SkillBank()
+    bank.add(make_skill(title="install requests", when_to_apply="fix ModuleNotFoundError requests", rules=["pip install requests"]))
+    bank.add(make_skill(title="add fixture", when_to_apply="add a pytest fixture", rules=["edit conftest.py"]))
+
+    candidate = make_skill(title="install requests candidate", when_to_apply="fix requests import error", rules=["pip install requests"])
+    results = bank.retrieve_similar(candidate, top_k=2)
+
+    assert results[0].skill.title == "install requests"
+
+
 def test_compact_drops_low_success_rate_skills():
     bank = SkillBank()
     bank.add(make_skill())
