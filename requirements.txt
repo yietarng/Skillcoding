@@ -1,0 +1,3 @@
+pytest>=7.4
+# Optional, only needed for AnthropicLLMClient / real LLM usage:
+# anthropic>=0.40

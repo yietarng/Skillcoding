@@ -1,0 +1,98 @@
+[
+  {
+    "task_id": "demo-task-1",
+    "task_description": "The test suite fails with ModuleNotFoundError: No module named 'requests'. Fix it.",
+    "success": true,
+    "steps": [
+      {
+        "index": 0,
+        "assistant_action": "Run the failing test to see the exact traceback.",
+        "tool_name": "shell",
+        "tool_input": {"command": "pytest -q"},
+        "tool_result": "ModuleNotFoundError: No module named 'requests'",
+        "observed": true
+      },
+      {
+        "index": 1,
+        "assistant_action": "Install the missing dependency: pip install requests",
+        "tool_name": "shell",
+        "tool_input": {"command": "pip install requests"},
+        "tool_result": "Successfully installed requests-2.31.0",
+        "observed": true
+      },
+      {
+        "index": 2,
+        "assistant_action": "Re-run the test suite to confirm the fix.",
+        "tool_name": "shell",
+        "tool_input": {"command": "pytest -q"},
+        "tool_result": "3 passed in 0.42s",
+        "observed": true
+      }
+    ],
+    "metadata": {"benchmark": "mock-1", "repo": "example/webapp"}
+  },
+  {
+    "task_id": "demo-task-2",
+    "task_description": "A pytest run fails because conftest.py is missing a fixture named 'tmp_repo'. Add it.",
+    "success": true,
+    "steps": [
+      {
+        "index": 0,
+        "assistant_action": "Search the test files for usages of the missing fixture.",
+        "tool_name": "grep",
+        "tool_input": {"pattern": "tmp_repo"},
+        "tool_result": "tests/test_clone.py:12: def test_clone(tmp_repo):",
+        "observed": true
+      },
+      {
+        "index": 1,
+        "assistant_action": "Add a tmp_repo fixture to conftest.py that creates a temporary git repository.",
+        "tool_name": "edit_file",
+        "tool_input": {"path": "conftest.py"},
+        "tool_result": "conftest.py updated: added fixture 'tmp_repo'",
+        "observed": true
+      },
+      {
+        "index": 2,
+        "assistant_action": "Re-run the previously failing test.",
+        "tool_name": "shell",
+        "tool_input": {"command": "pytest tests/test_clone.py -q"},
+        "tool_result": "1 passed in 0.11s",
+        "observed": true
+      }
+    ],
+    "metadata": {"benchmark": "mock-2", "repo": "example/gittools"}
+  },
+  {
+    "task_id": "demo-task-3",
+    "task_description": "setup.py references a package version that conflicts with requirements.txt. Reconcile them.",
+    "success": true,
+    "steps": [
+      {
+        "index": 0,
+        "assistant_action": "Diff the pinned versions in setup.py against requirements.txt.",
+        "tool_name": "shell",
+        "tool_input": {"command": "diff <(grep -o \"[a-z]*==\\S*\" setup.py) requirements.txt"},
+        "tool_result": "< click==8.0.0\n---\n> click==8.1.7",
+        "observed": true
+      },
+      {
+        "index": 1,
+        "assistant_action": "Update setup.py to match the version pinned in requirements.txt.",
+        "tool_name": "edit_file",
+        "tool_input": {"path": "setup.py"},
+        "tool_result": "setup.py updated: click==8.1.7",
+        "observed": true
+      },
+      {
+        "index": 2,
+        "assistant_action": "Reinstall the package in editable mode to confirm no conflict remains.",
+        "tool_name": "shell",
+        "tool_input": {"command": "pip install -e ."},
+        "tool_result": "Successfully installed example-pkg-0.1.0",
+        "observed": true
+      }
+    ],
+    "metadata": {"benchmark": "mock-3", "repo": "example/pkgtools"}
+  }
+]

@@ -1,0 +1,17 @@
+[project]
+name = "codeskill"
+version = "0.1.0"
+description = "Open reimplementation of the CODESKILL self-evolving skill-management architecture for coding agents."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+dev = ["pytest>=7.4"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["codeskill*"]
