@@ -13,7 +13,7 @@ from typing import Callable, Optional
 
 from codeskill.bank import SkillBank
 from codeskill.llm import LLMClient
-from codeskill.schema import Skill
+from codeskill.schema import Granularity, Skill
 
 
 @dataclass
@@ -46,9 +46,29 @@ class FrozenDownstreamAgent:
         """`exclude_trajectory_ids` implements the paper's same-instance
         leakage guard (Appendix C): pass the current evaluation instance's
         own trajectory id(s) so a skill extracted from this very instance
-        can't be retrieved to help solve it."""
-        retrieved = self.bank.retrieve(task_description, top_k=self.top_k, exclude_trajectory_ids=exclude_trajectory_ids)
-        skills = [r.skill for r in retrieved]
+        can't be retrieved to help solve it.
+
+        Retrieves task-level and event-driven skills as two separate calls,
+        each with its own `top_k` budget, matching Appendix C's "we build
+        separate retrieval indexes for task-level and event-driven skills,
+        so that the two granularities are matched with different query
+        signals" -- pooling both granularities into one shared top_k would
+        let one crowd out the other. (The paper also queries each
+        granularity differently -- task-level once with the task goal,
+        event-driven online with live execution signals; this single-shot
+        `solve_fn` abstraction has no rollout loop to source that online
+        signal from, so both calls here use the same `task_description`.)
+        """
+        task_level = self.bank.retrieve(
+            task_description, top_k=self.top_k, granularity=Granularity.GENERAL, exclude_trajectory_ids=exclude_trajectory_ids
+        )
+        event_driven = self.bank.retrieve(
+            task_description,
+            top_k=self.top_k,
+            granularity=Granularity.EVENT_DRIVEN,
+            exclude_trajectory_ids=exclude_trajectory_ids,
+        )
+        skills = [r.skill for r in task_level + event_driven]
         result = self.solve_fn(task_description, skills)
         result.used_skill_ids = [s.id for s in skills]
         if record_usage:

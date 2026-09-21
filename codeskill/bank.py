@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -91,10 +92,12 @@ class SkillBank:
         return True, None
 
     def replace(self, target_id: str, replacement: Skill, *, rationale: str = "") -> Skill:
-        """Replace `target_id`'s content in place with `replacement` (used
-        for both the maintenance policy's `merge` decision and the
-        evolution policy's `evolve` decision), bumping its version and
-        keeping its id/usage history/provenance."""
+        """Replace `target_id`'s content in place with `replacement`, bumping
+        its version and keeping its id/usage history/provenance. Used by
+        `SkillManagerPolicy._maintain` for both the maintenance policy's
+        `merge` decision (target = `merge_target_skill_id`) and, for an
+        evolution-sourced candidate, an `add` decision that commits the
+        revision (target = the evolver's named `target_skill_id`)."""
         target = self._skills[target_id]
         target.title = replacement.title
         target.granularity = replacement.granularity
@@ -102,8 +105,6 @@ class SkillBank:
         target.rules = replacement.rules
         target.provenance.extend(replacement.provenance)
         target.version += 1
-        import time
-
         target.updated_at = time.time()
         if rationale:
             target.provenance.append(Provenance(trajectory_id="", step_indices=[], note=rationale))

@@ -158,10 +158,15 @@ existing skill(s)     ┌──────────────────�
   skills are retrieved once before solving starts, but event-driven skills
   are retrieved *online, mid-rollout*, re-querying with "recent reasoning,
   executed actions, observations, error messages, command outputs" as the
-  agent proceeds (Appendix C). `FrozenDownstreamAgent` is a single-shot
-  `solve_fn` abstraction with no multi-turn rollout loop, so it can only
-  retrieve once, up front, using the initial task description for both
-  granularities -- a structural simplification, not a tunable parameter.
+  agent proceeds (Appendix C). `FrozenDownstreamAgent.attempt` does query
+  the two granularities as **separate retrieval calls with independent
+  `top_k` budgets** now (an earlier version pooled both into one shared
+  `top_k`, letting one granularity crowd out the other -- fixed, since
+  Appendix C is explicit that "we build separate retrieval indexes for
+  task-level and event-driven skills"), but it's still a single-shot
+  `solve_fn` abstraction with no multi-turn rollout loop, so both calls use
+  the same initial task description rather than a live, evolving query --
+  a structural simplification, not a tunable parameter.
 - The **GRPO training loop** (`codeskill/grpo.py`) and **SFT dataset
   builder** (`codeskill/sft_data.py`) are original scaffolding built to the
   paper's *description* of warm-start SFT + GRPO with hybrid reward --

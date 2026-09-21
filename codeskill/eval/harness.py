@@ -63,6 +63,18 @@ class BenchmarkAdapter(ABC):
         self-reported success -- since this is exactly the sparse execution
         signal the paper's hybrid reward and the final reported pass rates
         depend on.
+
+        The paper defines its verifier as `V(tau) in [0,1]`, i.e.
+        potentially a continuous/partial-credit score (e.g. EnvBench's
+        per-instance issue count suggests fractional resolution is
+        meaningful there), not necessarily a hard pass/fail. This interface
+        simplifies to a bool for the benchmarks that are genuinely binary
+        (SWE-Bench-Verified's FAIL_TO_PASS/PASS_TO_PASS gate, Terminal-
+        Bench-2's task grader); `codeskill.rewards.NoSkillBaselineCache` and
+        `ExecutionReward` already average several such bools into a
+        continuous baseline the way Algorithm 1 does. A benchmark that
+        genuinely needs fractional per-rollout credit should widen this
+        return type rather than force it through a bool.
         """
 
 
