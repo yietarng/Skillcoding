@@ -1,9 +1,11 @@
 """End-to-end orchestration: trajectories -> skill bank -> benchmark comparison.
 
 Ties the pieces together the way the paper's evaluation does: build/evolve a
-skill bank from a batch of trajectories, then compare the frozen downstream
-agent's benchmark pass rate with an empty bank ("no-skill baseline") against
-the same agent using the evolved bank.
+skill bank from a batch of trajectories (via `SkillManagerPolicy.run_round`,
+which runs event-level extraction (Fig 7) followed by maintenance (Fig 9)
+per trajectory), then compare the frozen downstream agent's benchmark pass
+rate with an empty bank ("no-skill baseline") against the same agent using
+the evolved bank.
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ from typing import Callable, Optional
 from codeskill.bank import SkillBank
 from codeskill.downstream_agent import FrozenDownstreamAgent, SolveFn
 from codeskill.eval.harness import BenchmarkAdapter, BenchmarkResult, run_benchmark
-from codeskill.extraction import SkillExtractor
+from codeskill.llm import LLMClient
 from codeskill.manager import RoundReport, SkillManagerPolicy
 from codeskill.schema import Trajectory
 
@@ -40,14 +42,14 @@ class PipelineReport:
 
 def run_pipeline(
     trajectories: list[Trajectory],
-    extractor: SkillExtractor,
+    llm: LLMClient,
     benchmark_adapter: BenchmarkAdapter,
     solve_fn_factory: SolveFnFactory,
     bank: Optional[SkillBank] = None,
     top_k: int = 5,
 ) -> PipelineReport:
     bank = bank if bank is not None else SkillBank()
-    manager = SkillManagerPolicy(extractor, bank)
+    manager = SkillManagerPolicy.from_llm(llm, bank, retrieval_top_k=top_k)
     round_report = manager.run_round(trajectories)
 
     baseline_bank = SkillBank()  # deliberately empty: the no-skill baseline

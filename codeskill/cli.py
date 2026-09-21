@@ -14,12 +14,12 @@ from codeskill.bank import SkillBank
 from codeskill.demo_mock import build_demo_llm
 from codeskill.downstream_agent import SolveResult
 from codeskill.eval.mock_benchmark import MockBenchmarkAdapter
-from codeskill.extraction import SkillExtractor
+from codeskill.extraction import EventSkillExtractor
 from codeskill.llm import AnthropicLLMClient, LLMClient
 from codeskill.manager import SkillManagerPolicy
 from codeskill.pipeline import run_pipeline
 from codeskill.schema import Skill, load_trajectories
-from codeskill.sft_data import build_warm_start_dataset, export_jsonl, generate_teacher_dataset
+from codeskill.sft_data import build_event_extraction_dataset, export_jsonl
 
 
 def _make_llm(use_anthropic: bool) -> LLMClient:
@@ -40,8 +40,8 @@ def _demo_solve_fn_factory(bank: SkillBank):
         if not skills:
             trace = f"Attempting task with no prior skills: {task_description}\nSOLUTION: generic attempt, no specific fix applied."
             return SolveResult(success=False, trace=trace)
-        skill_lines = "\n".join(f"- {step}" for s in skills for step in s.steps)
-        trace = f"Attempting task: {task_description}\nApplying retrieved skill steps:\n{skill_lines}\nSOLUTION: applied retrieved skill steps."
+        rule_lines = "\n".join(f"- {rule}" for s in skills for rule in s.rules)
+        trace = f"Attempting task: {task_description}\nApplying retrieved skill rules:\n{rule_lines}\nSOLUTION: applied retrieved skill rules."
         return SolveResult(success=True, trace=trace)
 
     return solve
@@ -50,27 +50,26 @@ def _demo_solve_fn_factory(bank: SkillBank):
 def cmd_demo(args: argparse.Namespace) -> None:
     trajectories = load_trajectories(args.trajectories)
     llm = build_demo_llm()
-    extractor = SkillExtractor(llm)
     benchmark = MockBenchmarkAdapter()
 
     report = run_pipeline(
         trajectories=trajectories,
-        extractor=extractor,
+        llm=llm,
         benchmark_adapter=benchmark,
         solve_fn_factory=_demo_solve_fn_factory,
         top_k=args.top_k,
     )
 
     print(f"Processed {len(trajectories)} trajectories.")
-    print(f"Operations applied: {sum(1 for o in report.round_report.outcomes if o.applied)}"
-          f" / {len(report.round_report.outcomes)}")
-    for outcome in report.round_report.outcomes:
+    applied = sum(1 for o in report.round_report.stage_outcomes if o.applied)
+    print(f"Stage outcomes applied: {applied} / {len(report.round_report.stage_outcomes)}")
+    for outcome in report.round_report.stage_outcomes:
         status = "OK" if outcome.applied else "SKIPPED"
-        print(f"  [{status}] {outcome.operation.op_type.value}: {outcome.detail}")
+        print(f"  [{status}] {outcome.stage}: {outcome.detail}")
     print()
     print("Skill bank:")
     for skill in report.bank.active_skills():
-        print(f"  - ({skill.granularity.value}) {skill.name}: {skill.description}")
+        print(f"  - ({skill.granularity.value}) {skill.title}: {skill.when_to_apply}")
     print()
     print(report.summary())
 
@@ -79,14 +78,16 @@ def cmd_extract(args: argparse.Namespace) -> None:
     trajectories = load_trajectories(args.trajectories)
     bank = SkillBank.load(args.bank) if args.bank else SkillBank()
     llm = _make_llm(args.anthropic)
-    manager = SkillManagerPolicy(SkillExtractor(llm), bank)
+    manager = SkillManagerPolicy.from_llm(llm, bank)
     report = manager.run_round(trajectories)
 
-    for outcome in report.outcomes:
+    for outcome in report.stage_outcomes:
         status = "OK" if outcome.applied else "SKIPPED"
-        print(f"[{status}] {outcome.operation.op_type.value}: {outcome.detail}")
-    print(f"Bank size: {report.bank_size_before} -> {report.bank_size_after}"
-          f" (compacted {len(report.compacted_skill_ids)})")
+        print(f"[{status}] {outcome.stage}: {outcome.detail}")
+    print(
+        f"Bank size: {report.bank_size_before} -> {report.bank_size_after}"
+        f" (compacted {len(report.compacted_skill_ids)})"
+    )
 
     bank.save(args.out_bank)
     print(f"Saved bank to {args.out_bank}")
@@ -95,11 +96,10 @@ def cmd_extract(args: argparse.Namespace) -> None:
 def cmd_build_sft(args: argparse.Namespace) -> None:
     trajectories = load_trajectories(args.trajectories)
     teacher_llm = _make_llm(args.anthropic)
-    teacher_extractor = SkillExtractor(teacher_llm)
-    labeled = generate_teacher_dataset(trajectories, teacher_extractor)
-    examples = build_warm_start_dataset(labeled)
+    teacher_extractor = EventSkillExtractor(teacher_llm)
+    examples = build_event_extraction_dataset(trajectories, teacher_extractor)
     export_jsonl(examples, args.out)
-    print(f"Wrote {len(examples)} SFT examples to {args.out}")
+    print(f"Wrote {len(examples)} event-extraction SFT examples to {args.out}")
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
@@ -125,14 +125,14 @@ def build_parser() -> argparse.ArgumentParser:
     demo_p.add_argument("--top-k", type=int, default=3)
     demo_p.set_defaults(func=cmd_demo)
 
-    extract_p = sub.add_parser("extract", help="Extract/evolve skills from trajectories into a skill bank.")
+    extract_p = sub.add_parser("extract", help="Extract/maintain skills from trajectories into a skill bank.")
     extract_p.add_argument("--trajectories", required=True)
     extract_p.add_argument("--bank", default=None, help="Existing bank JSON to load and evolve.")
     extract_p.add_argument("--out-bank", required=True)
     extract_p.add_argument("--anthropic", action="store_true", help="Use a real Anthropic model instead of the mock LLM.")
     extract_p.set_defaults(func=cmd_extract)
 
-    sft_p = sub.add_parser("build-sft", help="Build a warm-start SFT dataset from teacher-labeled trajectories.")
+    sft_p = sub.add_parser("build-sft", help="Build a warm-start SFT dataset (event-extraction stage) from teacher-labeled trajectories.")
     sft_p.add_argument("--trajectories", required=True)
     sft_p.add_argument("--out", required=True)
     sft_p.add_argument("--anthropic", action="store_true", help="Use a real Anthropic model as the teacher.")

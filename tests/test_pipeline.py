@@ -3,7 +3,6 @@ from pathlib import Path
 from codeskill.cli import _demo_solve_fn_factory
 from codeskill.demo_mock import build_demo_llm
 from codeskill.eval.mock_benchmark import MockBenchmarkAdapter
-from codeskill.extraction import SkillExtractor
 from codeskill.pipeline import run_pipeline
 from codeskill.schema import load_trajectories
 
@@ -12,20 +11,21 @@ EXAMPLES = Path(__file__).resolve().parent.parent / "examples" / "sample_traject
 
 def test_full_pipeline_end_to_end_with_mock_llm():
     trajectories = load_trajectories(EXAMPLES)
-    extractor = SkillExtractor(build_demo_llm())
+    llm = build_demo_llm()
     benchmark = MockBenchmarkAdapter()
 
     report = run_pipeline(
         trajectories=trajectories,
-        extractor=extractor,
+        llm=llm,
         benchmark_adapter=benchmark,
         solve_fn_factory=_demo_solve_fn_factory,
         top_k=3,
     )
 
-    # Skills were actually extracted from all three trajectories.
+    # Skills were actually extracted and added for all three trajectories
+    # (the demo bank starts empty, so maintenance always decides "add").
     assert len(report.bank) == 3
-    assert all(o.applied for o in report.round_report.outcomes)
+    assert all(o.applied for o in report.round_report.stage_outcomes)
 
     # A populated bank should out-perform the no-skill baseline on this
     # benchmark, since the mock benchmark's expected fixes are exactly what
@@ -37,12 +37,12 @@ def test_full_pipeline_end_to_end_with_mock_llm():
 
 def test_pipeline_summary_is_human_readable():
     trajectories = load_trajectories(EXAMPLES)
-    extractor = SkillExtractor(build_demo_llm())
+    llm = build_demo_llm()
     benchmark = MockBenchmarkAdapter()
 
     report = run_pipeline(
         trajectories=trajectories,
-        extractor=extractor,
+        llm=llm,
         benchmark_adapter=benchmark,
         solve_fn_factory=_demo_solve_fn_factory,
     )

@@ -4,6 +4,11 @@ Mirrors the paper's description of a bank that (a) stays auditable --
 every mutation is versioned and every exclusion has a logged reason -- and
 (b) stays compact -- redundant or unhelpful skills get merged/dropped so the
 bank doesn't grow without bound across rounds of iterative construction.
+
+Per Figure 9/13 of the appendix, a "merge" decision doesn't mechanically
+union two skills' rule lists: the maintenance policy itself produces the
+full merged `{title, when_to_apply, rules}` object, which *replaces* the
+target skill in place. `SkillBank.replace` implements exactly that.
 """
 from __future__ import annotations
 
@@ -26,7 +31,7 @@ class RetrievalResult:
 class ExclusionRecord:
     """Why a candidate was *not* added, or why a skill was dropped."""
 
-    skill_name: str
+    skill_title: str
     reason: str
     round_num: int
 
@@ -40,7 +45,7 @@ class BankSnapshot:
 
 
 class SkillBank:
-    """Mutable store of `Skill` objects with add/update/merge/drop operations."""
+    """Mutable store of `Skill` objects with add/replace/drop operations."""
 
     def __init__(self) -> None:
         self._skills: dict[str, Skill] = {}
@@ -72,69 +77,42 @@ class SkillBank:
         return None
 
     def add(self, skill: Skill) -> tuple[bool, Optional[str]]:
-        """Add a new skill candidate.
+        """Add a new skill candidate (the maintenance policy's `add` decision).
 
         Returns `(accepted, exclusion_reason)`. A candidate is rejected (not
-        added) if it duplicates an already-active skill's content -- the
-        caller should route such cases to `update`/`merge` instead if new
-        provenance should still be recorded.
+        added) if it duplicates an already-active skill's content.
         """
         dup = self._duplicate_of(skill)
         if dup is not None:
             reason = f"duplicate_of:{dup.id}"
-            self._exclusions.append(ExclusionRecord(skill.name, reason, self.current_round))
+            self._exclusions.append(ExclusionRecord(skill.title, reason, self.current_round))
             return False, reason
         self._skills[skill.id] = skill
         return True, None
 
-    def update(self, skill_id: str, *, new_provenance: Optional[Provenance] = None, **field_updates) -> Skill:
-        """Apply an evolution step to an existing skill: revise its content
-        and/or attach new evidence, bumping its version."""
-        skill = self._skills[skill_id]
-        for field_name, value in field_updates.items():
-            if not hasattr(skill, field_name):
-                raise AttributeError(f"Skill has no field {field_name!r}")
-            setattr(skill, field_name, value)
-        if new_provenance is not None:
-            skill.provenance.append(new_provenance)
-        skill.version += 1
+    def replace(self, target_id: str, replacement: Skill, *, rationale: str = "") -> Skill:
+        """Replace `target_id`'s content in place with `replacement` (used
+        for both the maintenance policy's `merge` decision and the
+        evolution policy's `evolve` decision), bumping its version and
+        keeping its id/usage history/provenance."""
+        target = self._skills[target_id]
+        target.title = replacement.title
+        target.granularity = replacement.granularity
+        target.when_to_apply = replacement.when_to_apply
+        target.rules = replacement.rules
+        target.provenance.extend(replacement.provenance)
+        target.version += 1
         import time
 
-        skill.updated_at = time.time()
-        return skill
-
-    def merge(self, primary_id: str, absorbed_ids: list[str], rationale: str = "") -> Skill:
-        """Fold `absorbed_ids` into `primary_id`: union their steps/tags and
-        provenance, then deactivate the absorbed skills (kept for audit, not
-        deleted)."""
-        primary = self._skills[primary_id]
-        for other_id in absorbed_ids:
-            if other_id == primary_id:
-                continue
-            other = self._skills.get(other_id)
-            if other is None or not other.active:
-                continue
-            for step in other.steps:
-                if step not in primary.steps:
-                    primary.steps.append(step)
-            for tag in other.tags:
-                if tag not in primary.tags:
-                    primary.tags.append(tag)
-            primary.provenance.extend(other.provenance)
-            other.active = False
-            self._exclusions.append(
-                ExclusionRecord(other.name, f"merged_into:{primary_id} ({rationale})", self.current_round)
-            )
-        primary.version += 1
-        import time
-
-        primary.updated_at = time.time()
-        return primary
+        target.updated_at = time.time()
+        if rationale:
+            target.provenance.append(Provenance(trajectory_id="", step_indices=[], note=rationale))
+        return target
 
     def drop(self, skill_id: str, reason: str) -> None:
         skill = self._skills[skill_id]
         skill.active = False
-        self._exclusions.append(ExclusionRecord(skill.name, f"dropped:{reason}", self.current_round))
+        self._exclusions.append(ExclusionRecord(skill.title, f"dropped:{reason}", self.current_round))
 
     # -- retrieval ------------------------------------------------------
 
@@ -143,7 +121,7 @@ class SkillBank:
         return {t.strip(".,:;()[]{}").lower() for t in text.split() if len(t) > 2}
 
     def _skill_tokens(self, skill: Skill) -> set[str]:
-        body = " ".join([skill.name, skill.description, *skill.steps, *skill.tags])
+        body = " ".join([skill.title, skill.when_to_apply, *skill.rules])
         return self._tokenize(body)
 
     def retrieve(
@@ -155,8 +133,10 @@ class SkillBank:
         """Rank active skills by lexical overlap with `query`.
 
         Deliberately dependency-free (no embedding model required) so the
-        bank is usable offline; swap in a real embedding-similarity scorer
-        by subclassing and overriding this method for production use.
+        bank is usable offline; the paper mentions a MiniLM-based retrieval
+        setup (per the reconstruction notes) -- swap in a real
+        embedding-similarity scorer by subclassing and overriding this
+        method for production use.
         """
         query_tokens = self._tokenize(query)
         candidates = self.active_skills()
@@ -200,12 +180,7 @@ class SkillBank:
     # -- rounds / snapshots -------------------------------------------------
 
     def advance_round(self) -> BankSnapshot:
-        """Freeze the current bank state and start a new trial round.
-
-        Snapshots give the "explicit version control of bank state across
-        rounds" the reconstruction notes describe: you can always look back
-        at what the bank looked like before a given round's mutations.
-        """
+        """Freeze the current bank state and start a new trial round."""
         snapshot = BankSnapshot(
             round_num=self.current_round,
             skills={sid: copy.deepcopy(s.to_dict()) for sid, s in self._skills.items()},

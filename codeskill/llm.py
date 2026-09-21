@@ -25,6 +25,18 @@ class LLMClient(Protocol):
         ...
 
 
+def classify_output(text: str) -> str:
+    """Cheap pre-parse triage of a policy/judge LLM response, done before
+    attempting to parse it as JSON so a malformed manager output can be
+    logged with a reason instead of raising deep inside a JSON parser."""
+    stripped = text.strip()
+    if not stripped:
+        return "empty"
+    if "{" not in stripped or "}" not in stripped:
+        return "not_json"
+    return "looks_json"
+
+
 def extract_json(text: str) -> dict:
     """Best-effort extraction of a JSON object from raw LLM output.
 

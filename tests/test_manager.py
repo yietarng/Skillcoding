@@ -1,10 +1,11 @@
 import json
 
 from codeskill.bank import SkillBank
-from codeskill.extraction import SkillExtractor
+from codeskill.extraction import EventSkillExtractor, SkillEvolver, SkillMaintainer
 from codeskill.llm import MockLLMClient
 from codeskill.manager import SkillManagerPolicy
-from codeskill.schema import OperationType, Trajectory, TrajectoryStep
+from codeskill.prompts import EVENT_EXTRACTION_SYSTEM_PROMPT, SKILL_EVOLUTION_SYSTEM_PROMPT, SKILL_MAINTENANCE_SYSTEM_PROMPT
+from codeskill.schema import Granularity, Skill, Trajectory, TrajectoryStep
 
 
 def make_trajectory(task_id="t1") -> Trajectory:
@@ -19,74 +20,159 @@ def make_trajectory(task_id="t1") -> Trajectory:
     )
 
 
-def _llm_returning_add(name="install requests", cited=(1,)):
+GENERATED_SKILL = {
+    "title": "install requests",
+    "granularity": "event-driven",
+    "when_to_apply": "ModuleNotFoundError for requests",
+    "rules": ["pip install requests"],
+}
+
+
+def _manager_with(bank: SkillBank, *, generate=True, maintenance_response: dict) -> SkillManagerPolicy:
     llm = MockLLMClient()
-    llm.register(
-        lambda system, prompt: True,
-        lambda system, prompt: json.dumps(
-            {
-                "operations": [
-                    {
-                        "op_type": "add",
-                        "name": name,
-                        "description": "pip install the missing dependency",
-                        "steps": ["pip install requests"],
-                        "granularity": "event",
-                        "cited_step_indices": list(cited),
-                        "rationale": "grounded",
-                    }
-                ]
-            }
-        ),
-    )
-    return llm
+
+    def extraction_responder(system, prompt):
+        if generate:
+            return json.dumps({"action": "generate", "skill": GENERATED_SKILL})
+        return json.dumps({"action": "skip", "reason": "no strong reusable event"})
+
+    llm.register(lambda system, prompt: system == EVENT_EXTRACTION_SYSTEM_PROMPT, extraction_responder)
+    llm.register(lambda system, prompt: system == SKILL_MAINTENANCE_SYSTEM_PROMPT, lambda system, prompt: json.dumps(maintenance_response))
+    return SkillManagerPolicy.from_llm(llm, bank)
 
 
-def test_process_trajectory_adds_skill_to_bank():
-    bank = SkillBank()
-    manager = SkillManagerPolicy(SkillExtractor(_llm_returning_add()), bank)
+def test_process_event_trajectory_adds_skill_to_bank():
+    manager = _manager_with(SkillBank(), maintenance_response={"action": "add", "reason": "distinct"})
 
-    outcomes = manager.process_trajectory(make_trajectory())
+    outcomes = manager.process_event_trajectory(make_trajectory())
+
+    assert [o.stage for o in outcomes] == ["extract_event", "maintain_add"]
+    assert all(o.applied for o in outcomes)
+    assert len(manager.bank) == 1
+
+
+def test_process_event_trajectory_skip_short_circuits_maintenance():
+    manager = _manager_with(SkillBank(), generate=False, maintenance_response={"action": "add", "reason": "unused"})
+
+    outcomes = manager.process_event_trajectory(make_trajectory())
 
     assert len(outcomes) == 1
-    assert outcomes[0].applied is True
-    assert len(bank) == 1
+    assert outcomes[0].stage == "extract_event"
+    assert outcomes[0].applied is False
+    assert len(manager.bank) == 0
+
+
+def test_process_event_trajectory_drop_leaves_bank_empty():
+    manager = _manager_with(SkillBank(), maintenance_response={"action": "drop", "reason": "redundant"})
+
+    outcomes = manager.process_event_trajectory(make_trajectory())
+
+    assert outcomes[-1].stage == "maintain_drop"
+    assert outcomes[-1].applied is False
+    assert len(manager.bank) == 0
+
+
+def test_process_event_trajectory_merge_replaces_existing_skill():
+    bank = SkillBank()
+    existing = Skill(
+        title="install requests",
+        granularity=Granularity.EVENT_DRIVEN,
+        when_to_apply="ModuleNotFoundError for requests",
+        rules=["pip install requests"],
+    )
+    bank.add(existing)
+
+    manager = _manager_with(
+        bank,
+        maintenance_response={
+            "action": "merge",
+            "merge_target_skill_id": existing.id,
+            "reason": "same capability identity",
+            "skill": {
+                "title": "install requests (merged)",
+                "granularity": "event-driven",
+                "when_to_apply": "ModuleNotFoundError for requests",
+                "rules": ["pip install requests", "verify with pip show"],
+            },
+        },
+    )
+
+    outcomes = manager.process_event_trajectory(make_trajectory())
+
+    assert outcomes[-1].stage == "maintain_merge"
+    assert outcomes[-1].applied is True
+    updated = bank.get(existing.id)
+    assert updated.title == "install requests (merged)"
+    assert "verify with pip show" in updated.rules
+    assert len(bank) == 1  # still one active skill, not two
 
 
 def test_run_round_advances_bank_round_and_reports_sizes():
-    bank = SkillBank()
-    manager = SkillManagerPolicy(SkillExtractor(_llm_returning_add()), bank)
+    manager = _manager_with(SkillBank(), maintenance_response={"action": "add", "reason": "distinct"})
 
     report = manager.run_round([make_trajectory()])
 
     assert report.bank_size_before == 0
     assert report.bank_size_after == 1
-    assert bank.current_round == 1
+    assert manager.bank.current_round == 1
 
 
-def test_run_round_second_trajectory_with_same_skill_is_deduplicated():
+def test_process_evolution_replaces_target_skill():
     bank = SkillBank()
-    manager = SkillManagerPolicy(SkillExtractor(_llm_returning_add()), bank)
+    existing = Skill(
+        title="install requests",
+        granularity=Granularity.EVENT_DRIVEN,
+        when_to_apply="ModuleNotFoundError for requests",
+        rules=["pip install requests"],
+    )
+    bank.add(existing)
 
-    manager.run_round([make_trajectory("t1")])
-    report2 = manager.run_round([make_trajectory("t2")])
+    llm = MockLLMClient()
+    llm.register(
+        lambda system, prompt: system == SKILL_EVOLUTION_SYSTEM_PROMPT,
+        lambda system, prompt: json.dumps(
+            {
+                "action": "evolve",
+                "target_skill_id": existing.id,
+                "reason": "new caution",
+                "skill": {
+                    "title": "install requests",
+                    "granularity": "event-driven",
+                    "when_to_apply": "ModuleNotFoundError for requests",
+                    "rules": ["pip install requests", "verify with pip show requests"],
+                },
+            }
+        ),
+    )
+    manager = SkillManagerPolicy(
+        bank=bank,
+        event_extractor=EventSkillExtractor(llm),
+        evolver=SkillEvolver(llm),
+        maintainer=SkillMaintainer(llm),
+    )
 
-    # second identical skill is a content duplicate, so the bank does not grow
-    assert report2.bank_size_after == 1
-    outcome = report2.outcomes[0]
-    assert outcome.applied is False
-    assert "duplicate_of" in outcome.detail
+    outcomes = manager.process_evolution([existing], make_trajectory())
+
+    assert outcomes[0].stage == "evolve"
+    assert outcomes[0].applied is True
+    updated = bank.get(existing.id)
+    assert "verify with pip show requests" in updated.rules
+    assert updated.version == 2
 
 
-def test_apply_operation_drop_deactivates_target():
+def test_process_evolution_skip_does_not_touch_bank():
     bank = SkillBank()
-    manager = SkillManagerPolicy(SkillExtractor(_llm_returning_add()), bank)
-    manager.process_trajectory(make_trajectory())
-    skill_id = bank.all_skills()[0].id
+    existing = Skill(title="install requests", granularity=Granularity.EVENT_DRIVEN, when_to_apply="d", rules=["r"])
+    bank.add(existing)
 
-    from codeskill.schema import SkillOperation
+    llm = MockLLMClient()
+    llm.register(
+        lambda system, prompt: system == SKILL_EVOLUTION_SYSTEM_PROMPT,
+        lambda system, prompt: json.dumps({"action": "skip", "reason": "evidence too weak"}),
+    )
+    manager = SkillManagerPolicy(bank=bank, event_extractor=EventSkillExtractor(llm), evolver=SkillEvolver(llm), maintainer=SkillMaintainer(llm))
 
-    outcome = manager.apply_operation(SkillOperation(op_type=OperationType.DROP, target_skill_id=skill_id, rationale="bad"))
+    outcomes = manager.process_evolution([existing], make_trajectory())
 
-    assert outcome.applied is True
-    assert bank.get(skill_id).active is False
+    assert outcomes[0].applied is False
+    assert bank.get(existing.id).version == 1

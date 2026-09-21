@@ -2,11 +2,12 @@
 
 Per the paper, training starts by warm-starting the manager policy with
 supervised data built from coding-agent trajectories paired with
-teacher-generated skill operations (i.e. a stronger model's extract/update/
-merge/drop decisions), before the RL (GRPO) stage takes over. This module
-builds that dataset in the same (system, prompt) -> completion shape used at
-inference time by `codeskill.extraction`, so a base model fine-tuned on it
-can be dropped in as the manager policy directly.
+teacher-generated skill operations (a stronger model's decisions), before
+the RL (GRPO) stage takes over. This module builds that dataset separately
+for each of the four appendix-prompt stages (task extraction, event
+extraction, evolution, maintenance), in the same (system, prompt) ->
+completion shape used at inference time, so a base model fine-tuned on it
+can be dropped in as that stage's policy directly.
 """
 from __future__ import annotations
 
@@ -14,8 +15,23 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from codeskill.extraction import SYSTEM_PROMPT, SkillExtractor, build_extraction_prompt
-from codeskill.schema import OperationType, SkillOperation, Trajectory
+from codeskill.extraction import (
+    EventSkillExtractor,
+    SkillEvolver,
+    SkillMaintainer,
+    TaskSkillExtractor,
+    build_event_extraction_prompt,
+    build_evolution_prompt,
+    build_maintenance_prompt,
+    build_task_extraction_prompt,
+)
+from codeskill.prompts import (
+    EVENT_EXTRACTION_SYSTEM_PROMPT,
+    SKILL_EVOLUTION_SYSTEM_PROMPT,
+    SKILL_MAINTENANCE_SYSTEM_PROMPT,
+    TASK_EXTRACTION_SYSTEM_PROMPT,
+)
+from codeskill.schema import Decision, EvolutionOutcome, ExtractionOutcome, MaintenanceOutcome, Skill, Trajectory
 
 
 @dataclass
@@ -25,67 +41,92 @@ class SFTExample:
     completion: str  # the target JSON string the policy should learn to produce
 
 
-def operation_to_dict(op: SkillOperation) -> dict:
-    d: dict = {"op_type": op.op_type.value, "rationale": op.rationale}
-    if op.skill is not None:
-        d.update(
-            {
-                "name": op.skill.name,
-                "description": op.skill.description,
-                "steps": op.skill.steps,
-                "granularity": op.skill.granularity.value,
-                "cited_step_indices": op.skill.provenance[0].step_indices if op.skill.provenance else [],
-                "preconditions": op.skill.preconditions,
-                "tags": op.skill.tags,
-            }
-        )
-    if op.target_skill_id is not None:
-        d["target_skill_id"] = op.target_skill_id
-    if op.merge_with:
-        d["merge_with"] = op.merge_with
-    return d
+def extraction_outcome_to_dict(outcome: ExtractionOutcome) -> dict:
+    if outcome.decision == Decision.GENERATE and outcome.skill is not None:
+        return {"action": "generate", "skill": outcome.skill.to_paper_dict()}
+    return {"action": "skip", "reason": outcome.reason}
 
 
-def build_example(trajectory: Trajectory, operations: list[SkillOperation], bank_summary: str = "") -> SFTExample:
-    prompt = build_extraction_prompt(trajectory, bank_summary)
-    completion = json.dumps({"operations": [operation_to_dict(op) for op in operations]}, indent=2)
-    return SFTExample(system=SYSTEM_PROMPT, prompt=prompt, completion=completion)
+def evolution_outcome_to_dict(outcome: EvolutionOutcome) -> dict:
+    if outcome.decision == Decision.EVOLVE and outcome.skill is not None:
+        return {
+            "action": "evolve",
+            "target_skill_id": outcome.target_skill_id,
+            "reason": outcome.reason,
+            "skill": outcome.skill.to_paper_dict(),
+        }
+    return {"action": "skip", "reason": outcome.reason}
 
 
-def generate_teacher_dataset(
-    trajectories: list[Trajectory],
-    teacher_extractor: SkillExtractor,
-    bank_summary: str = "",
-) -> list[tuple[Trajectory, list[SkillOperation]]]:
-    """Have a (presumably stronger) teacher model label each trajectory with
-    the skill operations it would take; only grounded, well-formed
-    operations survive `SkillExtractor.propose_operations`'s own checks."""
-    labeled = []
-    for trajectory in trajectories:
-        ops = teacher_extractor.propose_operations(trajectory)
-        labeled.append((trajectory, ops))
-    return labeled
+def maintenance_outcome_to_dict(outcome: MaintenanceOutcome) -> dict:
+    if outcome.decision == Decision.MERGE and outcome.skill is not None:
+        return {
+            "action": "merge",
+            "merge_target_skill_id": outcome.merge_target_skill_id,
+            "reason": outcome.reason,
+            "skill": outcome.skill.to_paper_dict(),
+        }
+    return {"action": outcome.decision.value, "reason": outcome.reason}
 
 
-def build_warm_start_dataset(
-    labeled: list[tuple[Trajectory, list[SkillOperation]]],
-    bank_summary: str = "",
-    *,
-    drop_pure_noop: bool = True,
+def _keep(drop_pure_skip: bool, decision: Decision) -> bool:
+    return not (drop_pure_skip and decision in (Decision.SKIP, Decision.DROP))
+
+
+def build_event_extraction_dataset(
+    trajectories: list[Trajectory], teacher: EventSkillExtractor, *, drop_pure_skip: bool = True
 ) -> list[SFTExample]:
-    """Turn teacher-labeled (trajectory, operations) pairs into SFT examples.
-
-    `drop_pure_noop` skips trajectories where the teacher produced only
-    NOOP/rejected operations -- they carry no positive supervision signal
-    for what a *good* extraction looks like, only that nothing was worth
-    extracting, which is a much rarer class worth downweighting rather than
-    dominating the warm-start set.
-    """
     examples = []
-    for trajectory, ops in labeled:
-        if drop_pure_noop and all(op.op_type == OperationType.NOOP for op in ops):
+    for trajectory in trajectories:
+        outcome = teacher.propose(trajectory)
+        if not _keep(drop_pure_skip, outcome.decision):
             continue
-        examples.append(build_example(trajectory, ops, bank_summary))
+        prompt = build_event_extraction_prompt(trajectory)
+        examples.append(SFTExample(EVENT_EXTRACTION_SYSTEM_PROMPT, prompt, json.dumps(extraction_outcome_to_dict(outcome))))
+    return examples
+
+
+def build_task_extraction_dataset(
+    trajectory_groups: list[list[Trajectory]], teacher: TaskSkillExtractor, *, drop_pure_skip: bool = True
+) -> list[SFTExample]:
+    examples = []
+    for group in trajectory_groups:
+        outcome = teacher.propose(group)
+        if not _keep(drop_pure_skip, outcome.decision):
+            continue
+        prompt = build_task_extraction_prompt(group)
+        examples.append(SFTExample(TASK_EXTRACTION_SYSTEM_PROMPT, prompt, json.dumps(extraction_outcome_to_dict(outcome))))
+    return examples
+
+
+def build_evolution_dataset(
+    cases: list[tuple[list[Skill], Trajectory]], teacher: SkillEvolver, *, drop_pure_skip: bool = True
+) -> list[SFTExample]:
+    examples = []
+    for existing_skills, trajectory in cases:
+        outcome = teacher.propose(existing_skills, trajectory)
+        if not _keep(drop_pure_skip, outcome.decision):
+            continue
+        prompt = build_evolution_prompt(existing_skills, trajectory)
+        examples.append(SFTExample(SKILL_EVOLUTION_SYSTEM_PROMPT, prompt, json.dumps(evolution_outcome_to_dict(outcome))))
+    return examples
+
+
+def build_maintenance_dataset(
+    cases: list[tuple[Skill, list[Skill]]], teacher: SkillMaintainer, *, drop_pure_skip: bool = False
+) -> list[SFTExample]:
+    """`drop_pure_skip` defaults to False here since `drop` is itself a
+    meaningful, common maintenance decision (unlike `skip` in extraction),
+    not a "nothing to learn from" case."""
+    examples = []
+    for candidate, retrieved in cases:
+        outcome = teacher.decide(candidate, retrieved)
+        if not _keep(drop_pure_skip, outcome.decision):
+            continue
+        prompt = build_maintenance_prompt(candidate, retrieved)
+        examples.append(
+            SFTExample(SKILL_MAINTENANCE_SYSTEM_PROMPT, prompt, json.dumps(maintenance_outcome_to_dict(outcome)))
+        )
     return examples
 
 

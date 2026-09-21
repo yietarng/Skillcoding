@@ -1,31 +1,29 @@
 """GRPO training skeleton for the skill-manager policy.
 
 Group Relative Policy Optimization needs no learned critic: for each
-trajectory, sample a *group* of candidate skill-operation completions from
-the current policy, score each with the hybrid reward, and turn the
-within-group reward distribution into an advantage (score minus the group's
-own mean, scaled by the group's own std). This module implements that
-rollout + advantage bookkeeping precisely, and leaves the actual gradient
-step behind the `PolicyModel.update` interface so it can be backed by
-whatever training stack is available (HF `transformers` + a custom loss,
-TRL, or a remote fine-tuning API) without this module needing to depend on
-any of them.
+context (a trajectory, a trajectory group, an evolution case, or a
+maintenance case -- whichever the stage being trained needs), sample a
+*group* of candidate completions from the current policy, score each with
+the hybrid reward, and turn the within-group reward distribution into an
+advantage (score minus the group's own mean, scaled by the group's own
+std). This module implements that rollout + advantage bookkeeping exactly
+once, generically over all four appendix-prompt stages (see
+`codeskill.extraction` and `codeskill.prompts`) via injected
+`build_prompt`/`parse`/`score` callables, rather than duplicating it per
+stage.
 
 Running a real gradient step requires a local/accessible base model and a
 training loop far too heavy to embed here; what's implemented is everything
-paper-shaped *around* that step -- sampling, reward scoring shared with the
-inference-time validation path, and advantage computation -- so plugging in
-a concrete `PolicyModel` is the only thing left to do to actually train.
+paper-shaped *around* that step -- sampling, reward scoring reusing the
+exact parsers used at inference time, and advantage computation -- so
+plugging in a concrete `PolicyModel` is the only thing left to do to
+actually train.
 """
 from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass, field
-from typing import Protocol
-
-from codeskill.extraction import SYSTEM_PROMPT, build_extraction_prompt, parse_operations
-from codeskill.rewards import HybridReward
-from codeskill.schema import SkillOperation, Trajectory
+from typing import Any, Callable, Protocol
 
 
 class PolicyModel(Protocol):
@@ -48,14 +46,14 @@ class GRPOSample:
     system: str
     prompt: str
     completion: str
-    operations: list[SkillOperation]
+    parsed: Any
     reward: float
     advantage: float = 0.0
 
 
 @dataclass
 class GRPOGroupResult:
-    trajectory: Trajectory
+    context: Any
     samples: list[GRPOSample] = field(default_factory=list)
 
     def mean_reward(self) -> float:
@@ -82,58 +80,58 @@ def compute_group_advantages(samples: list[GRPOSample], eps: float = 1e-4) -> No
 
 
 class GRPOTrainer:
+    """Stage-agnostic: pass the system prompt and stage-specific
+    `build_prompt`/`parse`/`score` for whichever of the four appendix
+    prompts (task extraction, event extraction, evolution, maintenance)
+    you're training. `parse` should reuse the exact parser
+    `codeskill.extraction` uses at inference time (e.g.
+    `parse_extraction_response`), so training-time and inference-time
+    validation can never drift apart.
+    """
+
     def __init__(
         self,
         policy: PolicyModel,
-        reward_fn: HybridReward,
+        system_prompt: str,
+        build_prompt: Callable[[Any], str],
+        parse: Callable[[str], Any],
+        score: Callable[[Any, Any], float],
         group_size: int = 4,
         temperature: float = 1.0,
     ):
         self.policy = policy
-        self.reward_fn = reward_fn
+        self.system_prompt = system_prompt
+        self.build_prompt = build_prompt
+        self.parse = parse
+        self.score = score
         self.group_size = group_size
         self.temperature = temperature
 
-    def rollout_group(self, trajectory: Trajectory, bank_summary: str = "") -> GRPOGroupResult:
-        prompt = build_extraction_prompt(trajectory, bank_summary)
-        completions = self.policy.sample(SYSTEM_PROMPT, prompt, n=self.group_size, temperature=self.temperature)
+    def rollout_group(self, context: Any) -> GRPOGroupResult:
+        prompt = self.build_prompt(context)
+        completions = self.policy.sample(self.system_prompt, prompt, n=self.group_size, temperature=self.temperature)
 
-        result = GRPOGroupResult(trajectory=trajectory)
+        result = GRPOGroupResult(context=context)
         for completion in completions:
-            operations = parse_operations(completion, trajectory)
-            reward = self._score_operations(operations, trajectory)
+            parsed = self.parse(completion)
+            reward = self.score(parsed, context)
             result.samples.append(
-                GRPOSample(
-                    system=SYSTEM_PROMPT,
-                    prompt=prompt,
-                    completion=completion,
-                    operations=operations,
-                    reward=reward,
-                )
+                GRPOSample(system=self.system_prompt, prompt=prompt, completion=completion, parsed=parsed, reward=reward)
             )
         compute_group_advantages(result.samples)
         return result
 
-    def _score_operations(self, operations: list[SkillOperation], trajectory: Trajectory) -> float:
-        if not operations:
-            return 0.0
-        # A completion can propose several operations; the sample's reward
-        # is their mean so a policy can't game the reward by padding one
-        # good operation with many low-effort ones.
-        scores = [self.reward_fn.score_operation(op, trajectory).total for op in operations]
-        return statistics.fmean(scores)
-
-    def train_step(self, trajectories: list[Trajectory], bank_summary: str = "") -> dict:
+    def train_step(self, contexts: list[Any]) -> dict:
         batch: list[GRPOSample] = []
         group_stats = []
-        for trajectory in trajectories:
-            group = self.rollout_group(trajectory, bank_summary)
+        for context in contexts:
+            group = self.rollout_group(context)
             batch.extend(group.samples)
             group_stats.append({"mean_reward": group.mean_reward(), "std_reward": group.std_reward()})
 
         update_stats = self.policy.update(batch)
         return {
-            "num_groups": len(trajectories),
+            "num_groups": len(contexts),
             "num_samples": len(batch),
             "mean_reward": statistics.fmean(s.reward for s in batch) if batch else 0.0,
             "groups": group_stats,

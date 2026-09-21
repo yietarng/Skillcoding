@@ -56,7 +56,8 @@ def make_llm_solver(llm: LLMClient, verifier: Optional[Callable[[str, str], bool
 
     def solve(task_description: str, skills: list[Skill]) -> SolveResult:
         skill_block = "\n\n".join(
-            f"Skill: {s.name}\n{s.description}\nSteps:\n" + "\n".join(f"  - {step}" for step in s.steps)
+            f"Skill: {s.title}\nWhen to apply: {s.when_to_apply}\nRules:\n"
+            + "\n".join(f"  - {rule}" for rule in s.rules)
             for s in skills
         )
         system = (

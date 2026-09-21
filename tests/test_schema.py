@@ -34,14 +34,14 @@ def test_trajectory_round_trip():
     assert restored.grounded_step_indices() == [0, 2]
 
 
-def test_skill_content_key_dedup_ignores_case_and_order_of_incidentals():
-    a = Skill(name="Install requests", description="pip install requests", steps=["pip install requests"], granularity=Granularity.EVENT)
-    b = Skill(name="install REQUESTS", description="Pip Install Requests", steps=["pip install requests"], granularity=Granularity.EVENT)
+def test_skill_content_key_dedup_ignores_case():
+    a = Skill(title="Install requests", granularity=Granularity.EVENT_DRIVEN, when_to_apply="pip install requests", rules=["pip install requests"])
+    b = Skill(title="install REQUESTS", granularity=Granularity.EVENT_DRIVEN, when_to_apply="Pip Install Requests", rules=["pip install requests"])
     assert a.content_key() == b.content_key()
 
 
 def test_skill_success_rate_and_usage():
-    skill = Skill(name="s", description="d", steps=["x"], granularity=Granularity.EVENT)
+    skill = Skill(title="s", granularity=Granularity.EVENT_DRIVEN, when_to_apply="d", rules=["x"])
     assert skill.success_rate() == 0.0
     skill.record_usage(True)
     skill.record_usage(False)
@@ -51,8 +51,15 @@ def test_skill_success_rate_and_usage():
 
 
 def test_skill_round_trip():
-    skill = Skill(name="s", description="d", steps=["x", "y"], granularity=Granularity.TASK, tags=["a"])
+    skill = Skill(title="s", granularity=Granularity.GENERAL, when_to_apply="d", rules=["x", "y"])
     restored = Skill.from_dict(skill.to_dict())
-    assert restored.name == skill.name
-    assert restored.granularity == Granularity.TASK
-    assert restored.steps == ["x", "y"]
+    assert restored.title == skill.title
+    assert restored.granularity == Granularity.GENERAL
+    assert restored.rules == ["x", "y"]
+
+
+def test_skill_to_paper_dict_matches_appendix_schema():
+    skill = Skill(title="s", granularity=Granularity.EVENT_DRIVEN, when_to_apply="d", rules=["x"])
+    d = skill.to_paper_dict()
+    assert set(d.keys()) == {"title", "granularity", "when_to_apply", "rules"}
+    assert d["granularity"] == "event-driven"

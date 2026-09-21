@@ -1,17 +1,20 @@
-"""Core data structures: trajectories, skills, provenance, and manager operations.
+"""Core data structures: trajectories, skills, provenance, and stage outcomes.
 
-Design notes (mapped from the CODESKILL paper description):
-  - Skills are extracted at two granularities: TASK (a whole successful/failed
-    episode, e.g. "how to fix a failing pytest import error") and EVENT (a
-    single reusable action pattern inside an episode, e.g. "run `pip show`
-    before editing setup.py to confirm the installed version").
-  - Every skill carries provenance: which trajectory and which steps within
-    it justify the skill's existence, so the bank stays auditable.
-  - Grounding rule ("C-only" task extraction, from the reconstruction notes):
-    a task-level skill is only accepted if each of its rule/steps cites an
-    assistant action that was followed by an *observed* tool result -- not a
-    hallucinated or predicted outcome. `Trajectory.is_grounded_span` enforces
-    this at the data-structure level so extractors can't silently skip it.
+The `Skill` schema and the three `*Outcome` dataclasses deliberately mirror
+the JSON schemas given in the CODESKILL paper's appendix (Figures 6-9, see
+`codeskill/prompts.py` for the verbatim prompts and source citation):
+
+  - generate/skip (task- and event-level extraction, Fig 6-7)
+  - evolve/skip (skill evolution, Fig 8)
+  - add/merge/drop (skill-bank maintenance, Fig 9)
+
+A skill is always `{title, granularity, when_to_apply, rules}` -- there is
+no separate "description" or "steps" field beyond what the paper's own
+schema defines. `Provenance.step_indices` is this codebase's own addition
+(not in the paper): a machine-checkable pointer to which trajectory steps a
+skill's evidence should trace back to, used by `codeskill/grounding.py` as a
+cheap automated safeguard alongside the paper's LLM-judged "groundedness"
+rubric dimension.
 """
 from __future__ import annotations
 
@@ -29,20 +32,21 @@ def _new_id(prefix: str) -> str:
 
 
 class Granularity(str, Enum):
-    """Level of abstraction a skill was extracted at."""
+    """Matches the paper's `granularity` field values exactly."""
 
-    TASK = "task"
-    EVENT = "event"
+    GENERAL = "general"
+    EVENT_DRIVEN = "event-driven"
 
 
-class OperationType(str, Enum):
-    """The management actions the learnable skill-manager policy can take."""
+class Decision(str, Enum):
+    """The action vocabulary across all three manager-policy stages."""
 
-    ADD = "add"
-    UPDATE = "update"
-    MERGE = "merge"
-    DROP = "drop"
-    NOOP = "noop"
+    GENERATE = "generate"  # extraction (Fig 6/7)
+    EVOLVE = "evolve"  # evolution (Fig 8)
+    ADD = "add"  # maintenance (Fig 9)
+    MERGE = "merge"  # maintenance (Fig 9)
+    DROP = "drop"  # maintenance (Fig 9)
+    SKIP = "skip"  # extraction or evolution
 
 
 @dataclass
@@ -51,7 +55,7 @@ class TrajectoryStep:
 
     `tool_result` is `None` until the tool has actually executed -- a step
     with `assistant_action` set but `tool_result` still `None` is *not*
-    grounded and must not back a task-level skill's citation.
+    grounded, and `codeskill.grounding` never treats it as evidence.
     """
 
     index: int
@@ -101,12 +105,7 @@ class Trajectory:
         return [s.index for s in self.steps if s.is_grounded()]
 
     def is_grounded_span(self, indices: list[int]) -> bool:
-        """True iff every cited step index is a grounded (observed) step.
-
-        This is the data-level enforcement of the paper's "C-only" rule:
-        a skill may only cite assistant actions that were actually followed
-        by an observed tool result, never a predicted/hallucinated one.
-        """
+        """True iff every given step index is a grounded (observed) step."""
         if not indices:
             return False
         grounded = set(self.grounded_step_indices())
@@ -136,10 +135,11 @@ class Trajectory:
 
 @dataclass
 class Provenance:
-    """Links a skill back to the exact evidence that justified it."""
+    """Links a skill back to the trajectory (and, as a runtime addition
+    beyond the paper, the specific steps) that justified it."""
 
     trajectory_id: str
-    step_indices: list[int]
+    step_indices: list[int] = field(default_factory=list)
     trial_round: int = 0
     extracted_at: float = field(default_factory=time.time)
     note: str = ""
@@ -147,20 +147,18 @@ class Provenance:
 
 @dataclass
 class Skill:
-    """A reusable procedural skill stored in the skill bank."""
+    """A reusable procedural skill, in the paper's own schema:
+    `{title, granularity, when_to_apply, rules}`."""
 
-    name: str
-    description: str
-    steps: list[str]
+    title: str
     granularity: Granularity
-    preconditions: list[str] = field(default_factory=list)
-    tags: list[str] = field(default_factory=list)
+    when_to_apply: str
+    rules: list[str] = field(default_factory=list)
     provenance: list[Provenance] = field(default_factory=list)
     id: str = field(default_factory=lambda: _new_id("skill"))
     version: int = 1
     usage_count: int = 0
     success_count: int = 0
-    quality_score: float = 0.0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     active: bool = True
@@ -177,46 +175,51 @@ class Skill:
         self.updated_at = time.time()
 
     def content_key(self) -> str:
-        """Cheap lexical fingerprint used for duplicate/merge detection."""
-        body = " ".join([self.name.lower(), self.description.lower(), *[s.lower() for s in self.steps]])
+        """Cheap lexical fingerprint used for duplicate/merge-candidate detection."""
+        body = " ".join([self.title.lower(), self.when_to_apply.lower(), *[r.lower() for r in self.rules]])
         tokens = sorted(set(t.strip(".,:;()") for t in body.split() if len(t) > 2))
         return "|".join(tokens)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_paper_dict(self) -> dict[str, Any]:
+        """The exact `skill` object shape the appendix prompts specify --
+        used when serializing this skill back into a prompt (e.g. as a
+        `PROPOSED_OUTPUT` or `EXISTING_PRIOR_KNOWLEDGE` for a judge)."""
         return {
-            "id": self.id,
-            "name": self.name,
-            "description": self.description,
-            "steps": self.steps,
+            "title": self.title,
             "granularity": self.granularity.value,
-            "preconditions": self.preconditions,
-            "tags": self.tags,
-            "provenance": [vars(p) for p in self.provenance],
-            "version": self.version,
-            "usage_count": self.usage_count,
-            "success_count": self.success_count,
-            "quality_score": self.quality_score,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "active": self.active,
+            "when_to_apply": self.when_to_apply,
+            "rules": self.rules,
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        d = self.to_paper_dict()
+        d.update(
+            {
+                "id": self.id,
+                "provenance": [vars(p) for p in self.provenance],
+                "version": self.version,
+                "usage_count": self.usage_count,
+                "success_count": self.success_count,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+                "active": self.active,
+            }
+        )
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Skill":
         prov = [Provenance(**p) for p in d.get("provenance", [])]
         return cls(
             id=d["id"],
-            name=d["name"],
-            description=d["description"],
-            steps=d["steps"],
+            title=d["title"],
             granularity=Granularity(d["granularity"]),
-            preconditions=d.get("preconditions", []),
-            tags=d.get("tags", []),
+            when_to_apply=d["when_to_apply"],
+            rules=d.get("rules", []),
             provenance=prov,
             version=d.get("version", 1),
             usage_count=d.get("usage_count", 0),
             success_count=d.get("success_count", 0),
-            quality_score=d.get("quality_score", 0.0),
             created_at=d.get("created_at", time.time()),
             updated_at=d.get("updated_at", time.time()),
             active=d.get("active", True),
@@ -224,19 +227,32 @@ class Skill:
 
 
 @dataclass
-class SkillOperation:
-    """One decision emitted by the skill-manager policy for a candidate skill.
+class ExtractionOutcome:
+    """Result of a task- or event-level extraction call (Fig 6/7): `generate`|`skip`."""
 
-    `target_skill_id` is set for UPDATE/DROP; `merge_with` lists the other
-    skill ids folded into this one for MERGE.
-    """
-
-    op_type: OperationType
+    decision: Decision
     skill: Optional[Skill] = None
+    reason: str = ""
+
+
+@dataclass
+class EvolutionOutcome:
+    """Result of an evolution call (Fig 8): `evolve`|`skip`."""
+
+    decision: Decision
     target_skill_id: Optional[str] = None
-    merge_with: list[str] = field(default_factory=list)
-    rationale: str = ""
-    exclusion_reason: Optional[str] = None
+    skill: Optional[Skill] = None
+    reason: str = ""
+
+
+@dataclass
+class MaintenanceOutcome:
+    """Result of a skill-bank maintenance call (Fig 9): `add`|`merge`|`drop`."""
+
+    decision: Decision
+    merge_target_skill_id: Optional[str] = None
+    skill: Optional[Skill] = None
+    reason: str = ""
 
 
 def load_trajectories(path: str | Path) -> list[Trajectory]:

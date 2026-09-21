@@ -1,88 +1,137 @@
-"""The learnable skill-manager policy: extraction + bank maintenance.
+"""The learnable skill-manager policy: extraction/evolution + bank maintenance.
 
-At inference time this is "extractor proposes, manager applies": the
-`SkillExtractor` LLM call proposes operations, and `SkillManagerPolicy`
-applies them to a `SkillBank`, handling the bookkeeping (rejecting
-duplicates, resolving merge/update targets, running compaction at the end
-of a round) that keeps the bank both useful and bounded.
+At inference time this is "extract or evolve, then maintain": an
+extraction (Fig 6/7) or evolution (Fig 8) call proposes a candidate skill,
+and -- for extraction only -- a maintenance call (Fig 9) decides how it
+enters the bank (add/merge/drop) by comparing it against retrieved similar
+skills. Evolution instead revises a specific existing skill directly (no
+separate maintenance step -- Fig 8's `evolve` already names its target).
 
-During RL training (see `codeskill.grpo`), it's this same propose+apply
-policy whose *proposals* are sampled, scored by the hybrid reward, and
-optimized -- the apply-side bookkeeping here is deterministic and not
-itself learned.
+During RL training (see `codeskill.grpo`), it's these same LLM calls whose
+*proposals* are sampled, scored by the hybrid reward, and optimized -- the
+bank-mutation bookkeeping here (dedup, replace-in-place, compaction) is
+deterministic and not itself learned.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from codeskill.bank import SkillBank
-from codeskill.extraction import SkillExtractor
-from codeskill.schema import OperationType, SkillOperation, Trajectory
+from codeskill.extraction import EventSkillExtractor, SkillEvolver, SkillMaintainer, TaskSkillExtractor
+from codeskill.llm import LLMClient
+from codeskill.schema import Decision, Skill, Trajectory
 
 
 @dataclass
-class OperationOutcome:
-    operation: SkillOperation
+class StageOutcome:
+    stage: str  # "extract_event" | "extract_task" | "maintain_add" | "maintain_merge" | "maintain_drop" | "evolve"
+    detail: str
     applied: bool
-    detail: str = ""
+    skill_id: Optional[str] = None
 
 
 @dataclass
 class RoundReport:
     round_num: int
-    outcomes: list[OperationOutcome] = field(default_factory=list)
+    stage_outcomes: list[StageOutcome] = field(default_factory=list)
     compacted_skill_ids: list[str] = field(default_factory=list)
     bank_size_before: int = 0
     bank_size_after: int = 0
 
 
 class SkillManagerPolicy:
-    def __init__(self, extractor: SkillExtractor, bank: SkillBank):
-        self.extractor = extractor
+    def __init__(
+        self,
+        bank: SkillBank,
+        event_extractor: EventSkillExtractor,
+        task_extractor: Optional[TaskSkillExtractor] = None,
+        evolver: Optional[SkillEvolver] = None,
+        maintainer: Optional[SkillMaintainer] = None,
+        retrieval_top_k: int = 5,
+    ):
         self.bank = bank
+        self.event_extractor = event_extractor
+        self.task_extractor = task_extractor
+        self.evolver = evolver
+        self.maintainer = maintainer
+        self.retrieval_top_k = retrieval_top_k
 
-    def apply_operation(self, op: SkillOperation) -> OperationOutcome:
-        if op.op_type == OperationType.NOOP:
-            return OperationOutcome(op, applied=False, detail=op.exclusion_reason or "noop")
+    @classmethod
+    def from_llm(cls, llm: LLMClient, bank: SkillBank, retrieval_top_k: int = 5) -> "SkillManagerPolicy":
+        """Convenience constructor: one LLM client backing all four stages
+        (a `MockLLMClient` dispatches by matching each call's system prompt;
+        a real client just gets called four different ways)."""
+        return cls(
+            bank=bank,
+            event_extractor=EventSkillExtractor(llm),
+            task_extractor=TaskSkillExtractor(llm),
+            evolver=SkillEvolver(llm),
+            maintainer=SkillMaintainer(llm),
+            retrieval_top_k=retrieval_top_k,
+        )
 
-        if op.op_type == OperationType.ADD:
-            assert op.skill is not None
-            accepted, reason = self.bank.add(op.skill)
-            return OperationOutcome(op, applied=accepted, detail=reason or "added")
+    def _maintain(self, candidate: Skill) -> list[StageOutcome]:
+        if self.maintainer is None:
+            raise ValueError("no SkillMaintainer configured")
+        retrieved = [
+            r.skill
+            for r in self.bank.retrieve(candidate.when_to_apply, top_k=self.retrieval_top_k, granularity=candidate.granularity)
+        ]
+        decision = self.maintainer.decide(candidate, retrieved)
 
-        if op.op_type == OperationType.UPDATE:
-            assert op.skill is not None
-            if op.target_skill_id is None or self.bank.get(op.target_skill_id) is None:
-                # No valid target: fall back to treating this as a new skill
-                # rather than silently dropping the (grounded) evidence.
-                accepted, reason = self.bank.add(op.skill)
-                return OperationOutcome(op, applied=accepted, detail=reason or "added_as_fallback")
-            new_provenance = op.skill.provenance[0] if op.skill.provenance else None
-            self.bank.update(
-                op.target_skill_id,
-                new_provenance=new_provenance,
-                description=op.skill.description or self.bank.get(op.target_skill_id).description,
-                steps=list(dict.fromkeys(self.bank.get(op.target_skill_id).steps + op.skill.steps)),
-            )
-            return OperationOutcome(op, applied=True, detail=f"updated:{op.target_skill_id}")
+        if decision.decision == Decision.ADD:
+            accepted, reason = self.bank.add(candidate)
+            return [
+                StageOutcome(
+                    "maintain_add", reason or "added", applied=accepted, skill_id=candidate.id if accepted else None
+                )
+            ]
 
-        if op.op_type == OperationType.MERGE:
-            if op.target_skill_id is None or self.bank.get(op.target_skill_id) is None or not op.merge_with:
-                return OperationOutcome(op, applied=False, detail="invalid_merge_target")
-            self.bank.merge(op.target_skill_id, op.merge_with, rationale=op.rationale)
-            return OperationOutcome(op, applied=True, detail=f"merged_into:{op.target_skill_id}")
+        if decision.decision == Decision.MERGE:
+            if (
+                decision.merge_target_skill_id is None
+                or self.bank.get(decision.merge_target_skill_id) is None
+                or decision.skill is None
+            ):
+                return [StageOutcome("maintain_merge", "invalid_merge_target", applied=False)]
+            self.bank.replace(decision.merge_target_skill_id, decision.skill, rationale=decision.reason)
+            return [
+                StageOutcome(
+                    "maintain_merge",
+                    f"merged_into:{decision.merge_target_skill_id}",
+                    applied=True,
+                    skill_id=decision.merge_target_skill_id,
+                )
+            ]
 
-        if op.op_type == OperationType.DROP:
-            if op.target_skill_id is None or self.bank.get(op.target_skill_id) is None:
-                return OperationOutcome(op, applied=False, detail="invalid_drop_target")
-            self.bank.drop(op.target_skill_id, op.rationale or "manager_decision")
-            return OperationOutcome(op, applied=True, detail=f"dropped:{op.target_skill_id}")
+        # DROP (or a malformed response, which parse_maintenance_response also maps to DROP)
+        return [StageOutcome("maintain_drop", decision.reason or "dropped_candidate", applied=False)]
 
-        return OperationOutcome(op, applied=False, detail=f"unhandled_op_type:{op.op_type}")
+    def process_event_trajectory(self, trajectory: Trajectory) -> list[StageOutcome]:
+        outcome = self.event_extractor.propose(trajectory)
+        if outcome.decision != Decision.GENERATE or outcome.skill is None:
+            return [StageOutcome("extract_event", outcome.reason or "skip", applied=False)]
+        return [StageOutcome("extract_event", "generated candidate", applied=True)] + self._maintain(outcome.skill)
 
-    def process_trajectory(self, trajectory: Trajectory) -> list[OperationOutcome]:
-        proposals = self.extractor.propose_operations(trajectory, bank=self.bank)
-        return [self.apply_operation(op) for op in proposals]
+    def process_task_trajectories(self, trajectories: list[Trajectory]) -> list[StageOutcome]:
+        if self.task_extractor is None:
+            raise ValueError("no TaskSkillExtractor configured")
+        outcome = self.task_extractor.propose(trajectories)
+        if outcome.decision != Decision.GENERATE or outcome.skill is None:
+            return [StageOutcome("extract_task", outcome.reason or "skip", applied=False)]
+        return [StageOutcome("extract_task", "generated candidate", applied=True)] + self._maintain(outcome.skill)
+
+    def process_evolution(self, existing_skills: list[Skill], trajectory: Trajectory) -> list[StageOutcome]:
+        if self.evolver is None:
+            raise ValueError("no SkillEvolver configured")
+        outcome = self.evolver.propose(existing_skills, trajectory)
+        if outcome.decision != Decision.EVOLVE or outcome.skill is None or outcome.target_skill_id is None:
+            return [StageOutcome("evolve", outcome.reason or "skip", applied=False)]
+        if self.bank.get(outcome.target_skill_id) is None:
+            return [StageOutcome("evolve", f"invalid_target:{outcome.target_skill_id}", applied=False)]
+        self.bank.replace(outcome.target_skill_id, outcome.skill, rationale=outcome.reason)
+        return [StageOutcome("evolve", f"evolved:{outcome.target_skill_id}", applied=True, skill_id=outcome.target_skill_id)]
 
     def run_round(
         self,
@@ -92,9 +141,17 @@ class SkillManagerPolicy:
         min_uses: int = 3,
         min_success_rate: float = 0.2,
     ) -> RoundReport:
+        """Runs event-level extraction+maintenance over every trajectory in
+        the batch. Use `process_task_trajectories` directly (with your own
+        grouping of related trajectories) for task-level extraction, and
+        `process_evolution` for revising a specific existing skill --
+        neither is folded into this default round since both need
+        information (a trajectory grouping, or a target skill) this method
+        doesn't have.
+        """
         report = RoundReport(round_num=self.bank.current_round, bank_size_before=len(self.bank))
         for trajectory in trajectories:
-            report.outcomes.extend(self.process_trajectory(trajectory))
+            report.stage_outcomes.extend(self.process_event_trajectory(trajectory))
         if compact_after:
             report.compacted_skill_ids = self.bank.compact(min_uses=min_uses, min_success_rate=min_success_rate)
         report.bank_size_after = len(self.bank)

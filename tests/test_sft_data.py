@@ -1,9 +1,9 @@
 import json
 
-from codeskill.extraction import SkillExtractor
+from codeskill.extraction import EventSkillExtractor, SkillMaintainer
 from codeskill.llm import MockLLMClient
-from codeskill.schema import Trajectory, TrajectoryStep
-from codeskill.sft_data import build_warm_start_dataset, export_jsonl, generate_teacher_dataset, load_jsonl, operation_to_dict
+from codeskill.schema import Granularity, Skill, Trajectory, TrajectoryStep
+from codeskill.sft_data import build_event_extraction_dataset, build_maintenance_dataset, export_jsonl, load_jsonl
 
 
 def make_trajectory(task_id="t1") -> Trajectory:
@@ -18,86 +18,77 @@ def make_trajectory(task_id="t1") -> Trajectory:
     )
 
 
-def teacher_llm_with_op() -> MockLLMClient:
+def teacher_llm_with_generate() -> MockLLMClient:
     llm = MockLLMClient()
     llm.register(
         lambda system, prompt: True,
         lambda system, prompt: json.dumps(
             {
-                "operations": [
-                    {
-                        "op_type": "add",
-                        "name": "install requests",
-                        "description": "pip install the missing module",
-                        "steps": ["pip install requests"],
-                        "granularity": "event",
-                        "cited_step_indices": [1],
-                        "rationale": "grounded",
-                    }
-                ]
+                "action": "generate",
+                "skill": {
+                    "title": "install requests",
+                    "granularity": "event-driven",
+                    "when_to_apply": "ModuleNotFoundError for requests",
+                    "rules": ["pip install requests"],
+                },
             }
         ),
     )
     return llm
 
 
-def teacher_llm_noop() -> MockLLMClient:
+def teacher_llm_skip() -> MockLLMClient:
     llm = MockLLMClient()
-    llm.register(lambda system, prompt: True, lambda system, prompt: json.dumps({"operations": []}))
+    llm.register(lambda system, prompt: True, lambda system, prompt: json.dumps({"action": "skip", "reason": "too local"}))
     return llm
 
 
-def test_generate_teacher_dataset_and_build_warm_start_dataset():
+def test_build_event_extraction_dataset_includes_generate_examples():
     trajectories = [make_trajectory("t1"), make_trajectory("t2")]
-    extractor = SkillExtractor(teacher_llm_with_op())
+    teacher = EventSkillExtractor(teacher_llm_with_generate())
 
-    labeled = generate_teacher_dataset(trajectories, extractor)
-    examples = build_warm_start_dataset(labeled)
+    examples = build_event_extraction_dataset(trajectories, teacher)
 
-    assert len(labeled) == 2
     assert len(examples) == 2
-    parsed_completion = json.loads(examples[0].completion)
-    assert parsed_completion["operations"][0]["op_type"] == "add"
-    assert parsed_completion["operations"][0]["cited_step_indices"] == [1]
+    completion = json.loads(examples[0].completion)
+    assert completion["action"] == "generate"
+    assert completion["skill"]["title"] == "install requests"
 
 
-def test_build_warm_start_dataset_drops_pure_noop_by_default():
+def test_build_event_extraction_dataset_drops_pure_skip_by_default():
     trajectories = [make_trajectory("t1")]
-    extractor = SkillExtractor(teacher_llm_noop())
+    teacher = EventSkillExtractor(teacher_llm_skip())
 
-    labeled = generate_teacher_dataset(trajectories, extractor)
-    examples = build_warm_start_dataset(labeled)
+    examples = build_event_extraction_dataset(trajectories, teacher)
 
     assert examples == []
 
 
-def test_build_warm_start_dataset_keeps_noop_when_requested():
+def test_build_event_extraction_dataset_keeps_skip_when_requested():
     trajectories = [make_trajectory("t1")]
-    extractor = SkillExtractor(teacher_llm_noop())
+    teacher = EventSkillExtractor(teacher_llm_skip())
 
-    labeled = generate_teacher_dataset(trajectories, extractor)
-    examples = build_warm_start_dataset(labeled, drop_pure_noop=False)
+    examples = build_event_extraction_dataset(trajectories, teacher, drop_pure_skip=False)
 
     assert len(examples) == 1
 
 
-def test_operation_to_dict_includes_skill_fields():
-    trajectories = [make_trajectory("t1")]
-    extractor = SkillExtractor(teacher_llm_with_op())
-    ops = extractor.propose_operations(trajectories[0])
+def test_build_maintenance_dataset_keeps_drop_by_default():
+    llm = MockLLMClient()
+    llm.register(lambda system, prompt: True, lambda system, prompt: json.dumps({"action": "drop", "reason": "redundant"}))
+    candidate = Skill(title="c", granularity=Granularity.EVENT_DRIVEN, when_to_apply="d", rules=["r"])
+    existing = Skill(title="e", granularity=Granularity.EVENT_DRIVEN, when_to_apply="d", rules=["r"])
 
-    d = operation_to_dict(ops[0])
+    examples = build_maintenance_dataset([(candidate, [existing])], SkillMaintainer(llm))
 
-    assert d["op_type"] == "add"
-    assert d["name"] == "install requests"
-    assert d["cited_step_indices"] == [1]
+    assert len(examples) == 1
+    assert json.loads(examples[0].completion)["action"] == "drop"
 
 
 def test_export_and_load_jsonl_round_trip(tmp_path):
     trajectories = [make_trajectory("t1")]
-    extractor = SkillExtractor(teacher_llm_with_op())
-    labeled = generate_teacher_dataset(trajectories, extractor)
-    examples = build_warm_start_dataset(labeled)
+    teacher = EventSkillExtractor(teacher_llm_with_generate())
+    examples = build_event_extraction_dataset(trajectories, teacher)
 
     path = tmp_path / "sft.jsonl"
     export_jsonl(examples, path)

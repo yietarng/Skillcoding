@@ -1,158 +1,250 @@
-"""Skill extraction: turn a trajectory into candidate skill operations.
+"""The four manager-policy stages, each backed by its verbatim appendix
+prompt (see `codeskill/prompts.py`): task-level extraction (Fig 6),
+event-driven extraction (Fig 7), evolution (Fig 8), and skill-bank
+maintenance (Fig 9).
 
-This is the "propose" half of the learnable manager policy: given a
-trajectory (and, optionally, a summary of the current bank so the model can
-prefer UPDATE/MERGE over ADD when something similar already exists), an LLM
-is prompted to emit structured skill operations. Two safety nets sit between
-the raw LLM output and anything reaching the bank:
+Note what each stage does and doesn't see, per the paper's own description:
+extraction (Fig 6/7) sees only trajectories, never the existing bank;
+evolution (Fig 8) sees a set of already-relevant existing skills plus one
+new trajectory; maintenance (Fig 9) sees a candidate skill and retrieved
+similar skills but *no* trajectory at all ("maintain decisions are made
+without a trajectory" -- Fig 13's judge description). That separation is
+preserved here rather than collapsed into a single combined prompt.
 
-  1. `classify_output` -- cheap, pre-parse classification of the response
-     (empty / clearly not JSON / looks like JSON) so malformed manager
-     output is logged with a reason instead of raising deep inside a JSON
-     parser.
-  2. The grounding rule -- any operation that cites trajectory steps must
-     cite only steps that were actually *observed* (assistant action
-     followed by a real tool result), never a predicted/hallucinated one.
-     Ungrounded proposals are rejected here, before they ever reach the
-     bank, and are recorded as `SkillOperation(op_type=NOOP, exclusion_reason=...)`.
+The user-message formatting below (how a trajectory or a skill gets
+serialized into text) is this codebase's own design -- the appendix
+specifies the system prompt and what the user message must contain, but not
+its exact layout.
 """
 from __future__ import annotations
 
-from typing import Optional
+import json
 
-from codeskill.bank import SkillBank
-from codeskill.llm import LLMClient, extract_json
-from codeskill.schema import Granularity, OperationType, Provenance, Skill, SkillOperation, Trajectory
+from codeskill.llm import LLMClient, classify_output, extract_json
+from codeskill.prompts import (
+    EVENT_EXTRACTION_SYSTEM_PROMPT,
+    SKILL_EVOLUTION_SYSTEM_PROMPT,
+    SKILL_MAINTENANCE_SYSTEM_PROMPT,
+    TASK_EXTRACTION_SYSTEM_PROMPT,
+)
+from codeskill.schema import (
+    Decision,
+    EvolutionOutcome,
+    ExtractionOutcome,
+    Granularity,
+    MaintenanceOutcome,
+    Provenance,
+    Skill,
+    Trajectory,
+)
 
-SYSTEM_PROMPT = """You are the skill-management policy of a self-evolving coding agent.
-Given one agent trajectory (and, optionally, a summary of skills already in the bank),
-decide what to do with it: extract new reusable skills, update an existing skill with
-new evidence, merge redundant skills, or drop a skill that keeps failing.
-
-Rules:
-- Only cite step indices that appear in the trajectory's grounded (observed) steps.
-  Never cite a step whose tool result was not actually observed.
-- Prefer UPDATE or MERGE over ADD when a very similar skill already exists.
-- Emit EVENT-granularity skills for a single reusable action pattern, and
-  TASK-granularity skills for a whole reusable episode strategy.
-- Respond with a single JSON object: {"operations": [ ... ]}. Each operation has:
-  "op_type" (add|update|merge|drop|noop), "name", "description", "steps" (list[str]),
-  "granularity" (task|event), "cited_step_indices" (list[int]), "preconditions" (list[str]),
-  "tags" (list[str]), "target_skill_id" (for update/drop), "merge_with" (list[str], for merge),
-  "rationale" (str)."""
-
-
-def classify_output(text: str) -> str:
-    """Cheap pre-parse triage of a manager LLM response."""
-    stripped = text.strip()
-    if not stripped:
-        return "empty"
-    if "{" not in stripped or "}" not in stripped:
-        return "not_json"
-    return "looks_json"
+# -- user-message formatting (this codebase's own design) -------------------
 
 
-def build_extraction_prompt(trajectory: Trajectory, bank_summary: str = "") -> str:
-    lines = [f"Task: {trajectory.task_description}", f"Outcome: {'success' if trajectory.success else 'failure'}", ""]
+def format_trajectory(trajectory: Trajectory) -> str:
+    lines = [
+        f"Task context: {trajectory.task_description}",
+        f"Outcome: {'success' if trajectory.success else 'failure'}",
+        "Trajectory:",
+    ]
     for step in trajectory.steps:
-        grounded = "OBSERVED" if step.is_grounded() else "UNOBSERVED"
-        lines.append(f"[{step.index}] ({grounded}) assistant: {step.assistant_action}")
+        marker = "observed" if step.is_grounded() else "unobserved"
+        lines.append(f"  [{step.index}] ({marker}) action: {step.assistant_action}")
         if step.tool_name:
-            lines.append(f"      tool_call: {step.tool_name}({step.tool_input or {}})")
+            lines.append(f"        tool: {step.tool_name}({step.tool_input or {}})")
         if step.tool_result is not None:
-            lines.append(f"      tool_result: {step.tool_result}")
-    if bank_summary:
-        lines.append("\nExisting skill bank summary:\n" + bank_summary)
+            lines.append(f"        result: {step.tool_result}")
     return "\n".join(lines)
 
 
-class SkillExtractor:
-    def __init__(self, llm: LLMClient):
-        self.llm = llm
-
-    def summarize_bank(self, bank: SkillBank, limit: int = 20) -> str:
-        skills = bank.active_skills()[:limit]
-        return "\n".join(f"- ({s.id}) [{s.granularity.value}] {s.name}: {s.description}" for s in skills)
-
-    def propose_operations(self, trajectory: Trajectory, bank: Optional[SkillBank] = None) -> list[SkillOperation]:
-        bank_summary = self.summarize_bank(bank) if bank is not None else ""
-        prompt = build_extraction_prompt(trajectory, bank_summary)
-        raw = self.llm.complete(SYSTEM_PROMPT, prompt)
-        return parse_operations(raw, trajectory)
+def format_skill_ref(skill: Skill) -> str:
+    return json.dumps({"id": skill.id, **skill.to_paper_dict()})
 
 
-def _build_operation(raw_op: dict, trajectory: Trajectory) -> SkillOperation:
+def build_task_extraction_prompt(trajectories: list[Trajectory]) -> str:
+    header = trajectories[0].task_description if trajectories else ""
+    parts = [f"Task context: {header}", ""]
+    for i, trajectory in enumerate(trajectories, start=1):
+        parts.append(f"--- Trajectory {i} ---")
+        parts.append(format_trajectory(trajectory))
+        parts.append("")
+    return "\n".join(parts)
+
+
+def build_event_extraction_prompt(trajectory: Trajectory) -> str:
+    return format_trajectory(trajectory)
+
+
+def build_evolution_prompt(existing_skills: list[Skill], trajectory: Trajectory) -> str:
+    parts = ["Relevant existing skills:"]
+    for skill in existing_skills:
+        parts.append(f"  {format_skill_ref(skill)}")
+    parts.append("")
+    parts.append(format_trajectory(trajectory))
+    return "\n".join(parts)
+
+
+def build_maintenance_prompt(candidate: Skill, retrieved: list[Skill]) -> str:
+    parts = [f"Candidate skill:\n  {json.dumps(candidate.to_paper_dict())}", "", "Retrieved similar skills:"]
+    for skill in retrieved:
+        parts.append(f"  {format_skill_ref(skill)}")
+    return "\n".join(parts)
+
+
+# -- response parsing (shared by live LLM calls and codeskill.grpo rollouts) -
+
+
+def _parse_skill_payload(skill_data: dict) -> tuple[Skill | None, str]:
     try:
-        op_type = OperationType(raw_op.get("op_type", "noop"))
+        granularity = Granularity(skill_data.get("granularity"))
     except ValueError:
-        return SkillOperation(op_type=OperationType.NOOP, exclusion_reason=f"unknown_op_type:{raw_op.get('op_type')}")
-
-    cited = [int(i) for i in raw_op.get("cited_step_indices", [])]
-    rationale = raw_op.get("rationale", "")
-
-    if op_type in (OperationType.ADD, OperationType.UPDATE) and cited:
-        if not trajectory.is_grounded_span(cited):
-            return SkillOperation(
-                op_type=OperationType.NOOP,
-                rationale=rationale,
-                exclusion_reason=f"ungrounded_citation:{cited}",
-            )
-
-    if op_type == OperationType.DROP:
-        return SkillOperation(
-            op_type=op_type,
-            target_skill_id=raw_op.get("target_skill_id"),
-            rationale=rationale,
-        )
-
-    if op_type == OperationType.MERGE:
-        return SkillOperation(
-            op_type=op_type,
-            target_skill_id=raw_op.get("target_skill_id"),
-            merge_with=list(raw_op.get("merge_with", [])),
-            rationale=rationale,
-        )
-
-    if op_type == OperationType.NOOP:
-        return SkillOperation(op_type=op_type, rationale=rationale)
-
-    # ADD or UPDATE with a concrete skill payload.
-    try:
-        granularity = Granularity(raw_op.get("granularity", "event"))
-    except ValueError:
-        granularity = Granularity.EVENT
-
-    skill = Skill(
-        name=raw_op.get("name", "unnamed_skill"),
-        description=raw_op.get("description", ""),
-        steps=list(raw_op.get("steps", [])),
-        granularity=granularity,
-        preconditions=list(raw_op.get("preconditions", [])),
-        tags=list(raw_op.get("tags", [])),
-        provenance=[Provenance(trajectory_id=trajectory.id, step_indices=cited, note=rationale)],
-    )
-    return SkillOperation(
-        op_type=op_type,
-        skill=skill,
-        target_skill_id=raw_op.get("target_skill_id"),
-        rationale=rationale,
-    )
+        return None, f"invalid_granularity:{skill_data.get('granularity')!r}"
+    title = skill_data.get("title")
+    when_to_apply = skill_data.get("when_to_apply")
+    if not title or not when_to_apply:
+        return None, "missing_required_field:title_or_when_to_apply"
+    skill = Skill(title=title, granularity=granularity, when_to_apply=when_to_apply, rules=list(skill_data.get("rules", [])))
+    return skill, ""
 
 
-def parse_operations(raw: str, trajectory: Trajectory) -> list[SkillOperation]:
-    """Parse a raw manager-policy completion into `SkillOperation`s, applying
-    the same pre-parse classification and grounding checks used at
-    inference time. Shared by `SkillExtractor.propose_operations` (live LLM
-    call) and `codeskill.grpo` (scoring sampled rollouts during training),
-    so training-time and inference-time validation can never drift apart.
-    """
+def parse_extraction_response(raw: str) -> ExtractionOutcome:
+    """Shared parser for Fig 6 (task) and Fig 7 (event) responses: both use
+    the identical `{"action": "generate"|"skip", ...}` schema."""
     status = classify_output(raw)
     if status != "looks_json":
-        return [SkillOperation(op_type=OperationType.NOOP, rationale=raw, exclusion_reason=f"malformed_output:{status}")]
-
+        return ExtractionOutcome(decision=Decision.SKIP, reason=f"malformed_output:{status}")
     try:
         payload = extract_json(raw)
     except ValueError as exc:
-        return [SkillOperation(op_type=OperationType.NOOP, rationale=str(exc), exclusion_reason="unparseable_json")]
+        return ExtractionOutcome(decision=Decision.SKIP, reason=f"unparseable_json:{exc}")
 
-    return [_build_operation(raw_op, trajectory) for raw_op in payload.get("operations", [])]
+    action = payload.get("action")
+    if action == "skip":
+        return ExtractionOutcome(decision=Decision.SKIP, reason=payload.get("reason", ""))
+    if action == "generate":
+        skill, error = _parse_skill_payload(payload.get("skill", {}))
+        if skill is None:
+            return ExtractionOutcome(decision=Decision.SKIP, reason=error)
+        return ExtractionOutcome(decision=Decision.GENERATE, skill=skill, reason=payload.get("reason", ""))
+    return ExtractionOutcome(decision=Decision.SKIP, reason=f"unknown_action:{action!r}")
+
+
+def parse_evolution_response(raw: str) -> EvolutionOutcome:
+    status = classify_output(raw)
+    if status != "looks_json":
+        return EvolutionOutcome(decision=Decision.SKIP, reason=f"malformed_output:{status}")
+    try:
+        payload = extract_json(raw)
+    except ValueError as exc:
+        return EvolutionOutcome(decision=Decision.SKIP, reason=f"unparseable_json:{exc}")
+
+    action = payload.get("action")
+    if action == "skip":
+        return EvolutionOutcome(decision=Decision.SKIP, reason=payload.get("reason", ""))
+    if action == "evolve":
+        skill, error = _parse_skill_payload(payload.get("skill", {}))
+        if skill is None:
+            return EvolutionOutcome(decision=Decision.SKIP, reason=error)
+        return EvolutionOutcome(
+            decision=Decision.EVOLVE,
+            target_skill_id=payload.get("target_skill_id"),
+            skill=skill,
+            reason=payload.get("reason", ""),
+        )
+    return EvolutionOutcome(decision=Decision.SKIP, reason=f"unknown_action:{action!r}")
+
+
+def parse_maintenance_response(raw: str) -> MaintenanceOutcome:
+    status = classify_output(raw)
+    if status != "looks_json":
+        return MaintenanceOutcome(decision=Decision.DROP, reason=f"malformed_output:{status}")
+    try:
+        payload = extract_json(raw)
+    except ValueError as exc:
+        return MaintenanceOutcome(decision=Decision.DROP, reason=f"unparseable_json:{exc}")
+
+    action = payload.get("action")
+    if action == "add":
+        return MaintenanceOutcome(decision=Decision.ADD, reason=payload.get("reason", ""))
+    if action == "drop":
+        return MaintenanceOutcome(decision=Decision.DROP, reason=payload.get("reason", ""))
+    if action == "merge":
+        skill, error = _parse_skill_payload(payload.get("skill", {}))
+        if skill is None:
+            return MaintenanceOutcome(decision=Decision.DROP, reason=f"invalid_merge_payload:{error}")
+        return MaintenanceOutcome(
+            decision=Decision.MERGE,
+            merge_target_skill_id=payload.get("merge_target_skill_id"),
+            skill=skill,
+            reason=payload.get("reason", ""),
+        )
+    return MaintenanceOutcome(decision=Decision.DROP, reason=f"unknown_action:{action!r}")
+
+
+# -- the four stages ----------------------------------------------------
+
+
+class TaskSkillExtractor:
+    """Figure 6: task-level extraction from 2-3 related trajectories."""
+
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+
+    def propose(self, trajectories: list[Trajectory]) -> ExtractionOutcome:
+        prompt = build_task_extraction_prompt(trajectories)
+        raw = self.llm.complete(TASK_EXTRACTION_SYSTEM_PROMPT, prompt)
+        outcome = parse_extraction_response(raw)
+        if outcome.decision == Decision.GENERATE and outcome.skill is not None:
+            for trajectory in trajectories:
+                outcome.skill.provenance.append(
+                    Provenance(trajectory_id=trajectory.id, step_indices=trajectory.grounded_step_indices())
+                )
+        return outcome
+
+
+class EventSkillExtractor:
+    """Figure 7: event-driven extraction from a single full trajectory."""
+
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+
+    def propose(self, trajectory: Trajectory) -> ExtractionOutcome:
+        prompt = build_event_extraction_prompt(trajectory)
+        raw = self.llm.complete(EVENT_EXTRACTION_SYSTEM_PROMPT, prompt)
+        outcome = parse_extraction_response(raw)
+        if outcome.decision == Decision.GENERATE and outcome.skill is not None:
+            outcome.skill.provenance.append(
+                Provenance(trajectory_id=trajectory.id, step_indices=trajectory.grounded_step_indices())
+            )
+        return outcome
+
+
+class SkillEvolver:
+    """Figure 8: revise one existing skill given new trajectory evidence."""
+
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+
+    def propose(self, existing_skills: list[Skill], trajectory: Trajectory) -> EvolutionOutcome:
+        prompt = build_evolution_prompt(existing_skills, trajectory)
+        raw = self.llm.complete(SKILL_EVOLUTION_SYSTEM_PROMPT, prompt)
+        outcome = parse_evolution_response(raw)
+        if outcome.decision == Decision.EVOLVE and outcome.skill is not None:
+            outcome.skill.provenance.append(
+                Provenance(trajectory_id=trajectory.id, step_indices=trajectory.grounded_step_indices())
+            )
+        return outcome
+
+
+class SkillMaintainer:
+    """Figure 9: decide add/merge/drop for a candidate against retrieved
+    similar skills. Deliberately takes no trajectory -- the paper is
+    explicit that maintenance decisions are judged on skill text alone."""
+
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+
+    def decide(self, candidate: Skill, retrieved: list[Skill]) -> MaintenanceOutcome:
+        prompt = build_maintenance_prompt(candidate, retrieved)
+        raw = self.llm.complete(SKILL_MAINTENANCE_SYSTEM_PROMPT, prompt)
+        return parse_maintenance_response(raw)
