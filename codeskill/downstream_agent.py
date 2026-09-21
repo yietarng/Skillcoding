@@ -36,8 +36,18 @@ class FrozenDownstreamAgent:
         self.solve_fn = solve_fn
         self.top_k = top_k
 
-    def attempt(self, task_description: str, *, record_usage: bool = True) -> SolveResult:
-        retrieved = self.bank.retrieve(task_description, top_k=self.top_k)
+    def attempt(
+        self,
+        task_description: str,
+        *,
+        record_usage: bool = True,
+        exclude_trajectory_ids: Optional[set[str]] = None,
+    ) -> SolveResult:
+        """`exclude_trajectory_ids` implements the paper's same-instance
+        leakage guard (Appendix C): pass the current evaluation instance's
+        own trajectory id(s) so a skill extracted from this very instance
+        can't be retrieved to help solve it."""
+        retrieved = self.bank.retrieve(task_description, top_k=self.top_k, exclude_trajectory_ids=exclude_trajectory_ids)
         skills = [r.skill for r in retrieved]
         result = self.solve_fn(task_description, skills)
         result.used_skill_ids = [s.id for s in skills]

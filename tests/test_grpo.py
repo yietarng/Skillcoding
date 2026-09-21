@@ -82,7 +82,9 @@ def test_grpo_trainer_rollout_group_scores_and_ranks_samples():
 
     policy = LoggingOnlyPolicy(sampler)
     judge = EventQualityJudge(_judge_llm({"good": 3, "bad": 0}))
-    hybrid = HybridReward(quality_weight=1.0, execution_weight=0.0, alignment_weight=0.0)
+    # lam_dec=1.0 here isolates the quality-only branch of Algorithm 1
+    # (R = lam_dec*RQ), since this test has no execution rollout to score.
+    hybrid = HybridReward(lam_dec=1.0)
 
     def score(parsed, trajectory):
         if parsed.decision != Decision.GENERATE or parsed.skill is None:
@@ -117,7 +119,7 @@ def test_grpo_trainer_train_step_invokes_policy_update():
 
     policy = LoggingOnlyPolicy(sampler)
     judge = EventQualityJudge(_judge_llm({"good": 3, "bad": 0}))
-    hybrid = HybridReward(quality_weight=1.0, execution_weight=0.0, alignment_weight=0.0)
+    hybrid = HybridReward(lam_dec=1.0)
 
     def score(parsed, ctx):
         if parsed.decision != Decision.GENERATE or parsed.skill is None:

@@ -18,6 +18,13 @@ paper-shaped *around* that step -- sampling, reward scoring reusing the
 exact parsers used at inference time, and advantage computation -- so
 plugging in a concrete `PolicyModel` is the only thing left to do to
 actually train.
+
+`GRPOTrainer`'s `group_size=6` and `temperature=0.7` defaults match the
+paper's own reported RL settings (Table 4: "Group size 6 generations per
+prompt", "Rollout temperature 0.7"); the reward each sample should be
+scored with is `codeskill.rewards.HybridReward`, whose `combine()`
+implements Algorithm 1's `R = lam*R_Q + R_A*R_E` (skill-producing ops) /
+`R = lam_dec*R_Q` (add/drop/skip) exactly, with `lam=0.25` per Table 4.
 """
 from __future__ import annotations
 
@@ -96,8 +103,8 @@ class GRPOTrainer:
         build_prompt: Callable[[Any], str],
         parse: Callable[[str], Any],
         score: Callable[[Any, Any], float],
-        group_size: int = 4,
-        temperature: float = 1.0,
+        group_size: int = 6,
+        temperature: float = 0.7,
     ):
         self.policy = policy
         self.system_prompt = system_prompt

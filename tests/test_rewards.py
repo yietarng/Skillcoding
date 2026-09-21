@@ -1,7 +1,8 @@
 import json
+import random
 
-from codeskill.bank import SkillBank
-from codeskill.downstream_agent import FrozenDownstreamAgent, SolveResult
+from codeskill.downstream_agent import SolveResult
+from codeskill.eval.harness import BenchmarkAdapter, BenchmarkTask
 from codeskill.llm import MockLLMClient
 from codeskill.rewards import (
     BehaviorAlignmentJudge,
@@ -11,7 +12,9 @@ from codeskill.rewards import (
     HybridReward,
     JudgeScore,
     MergeQualityJudge,
+    NoSkillBaselineCache,
     TaskQualityJudge,
+    reverse_retrieve,
 )
 from codeskill.schema import Granularity, Skill, Trajectory, TrajectoryStep
 
@@ -117,39 +120,117 @@ def test_behavior_alignment_judge_scores_from_llm_output():
     assert score.overall() == 3 / 9
 
 
-def test_execution_reward_uses_downstream_agent_pass_rate():
-    bank = SkillBank()
+class _FixedAdapter(BenchmarkAdapter):
+    """A BenchmarkAdapter stand-in whose `verify` outcome per task_id is
+    fully scripted, so baseline-averaging and reverse-retrieval scoring are
+    each deterministic to test against."""
 
-    def always_pass(task, skills):
+    name = "fixed"
+
+    def __init__(self, outcomes_by_task_id: dict[str, list[bool]]):
+        self.outcomes_by_task_id = outcomes_by_task_id
+        self._call_index: dict[str, int] = {}
+
+    def load_tasks(self):
+        raise NotImplementedError
+
+    def verify(self, task: BenchmarkTask, solve_result: SolveResult) -> bool:
+        i = self._call_index.get(task.task_id, 0)
+        outcomes = self.outcomes_by_task_id[task.task_id]
+        outcome = outcomes[min(i, len(outcomes) - 1)]
+        self._call_index[task.task_id] = i + 1
+        return outcome
+
+
+def test_reverse_retrieve_ranks_tasks_by_overlap_with_skill_content():
+    skill = make_skill(title="install requests")  # when_to_apply mentions ModuleNotFoundError, requests
+    matching_task = BenchmarkTask("t-match", "ModuleNotFoundError for the requests package")
+    unrelated_task = BenchmarkTask("t-other", "add a pytest fixture for a temporary git repository")
+
+    ranked = reverse_retrieve(skill, [unrelated_task, matching_task], top_k=2)
+
+    assert ranked[0].task_id == "t-match"
+
+
+def test_no_skill_baseline_cache_averages_n_rollouts_and_caches():
+    task = BenchmarkTask("t1", "fix it")
+    # 3 of 4 no-skill rollouts pass -> baseline 0.75
+    adapter = _FixedAdapter({"t1": [True, True, True, False]})
+    calls = []
+
+    def no_skill_solve(task_description, skills):
+        calls.append(task_description)
         return SolveResult(success=True, trace="ok")
 
-    agent = FrozenDownstreamAgent(bank, always_pass, top_k=3)
-    reward = ExecutionReward(agent, eval_tasks=["task a", "task b"])
-    assert reward.score() == 1.0
+    cache = NoSkillBaselineCache(no_skill_solve, adapter, n=4)
+
+    assert cache.baseline(task) == 0.75
+    assert len(calls) == 4
+    # second call for the same task must hit the cache, not re-run rollouts
+    assert cache.baseline(task) == 0.75
+    assert len(calls) == 4
 
 
-def test_execution_reward_empty_tasks_is_zero():
-    bank = SkillBank()
-    agent = FrozenDownstreamAgent(bank, lambda t, s: SolveResult(success=True), top_k=3)
-    reward = ExecutionReward(agent, eval_tasks=[])
-    assert reward.score() == 0.0
+def test_execution_reward_matches_algorithm_1_formula():
+    matching_task = BenchmarkTask("t-match", "ModuleNotFoundError for the requests package")
+    baseline_adapter = _FixedAdapter({"t-match": [True, False, False, False]})  # baseline = 0.25
+    cache = NoSkillBaselineCache(lambda desc, skills: SolveResult(success=True), baseline_adapter, n=4)
+
+    skill_conditioned_adapter = _FixedAdapter({"t-match": [True]})  # skill-conditioned rollout passes -> V=1.0
+
+    def agent_solve(task_description, skills):
+        return SolveResult(success=True, trace="applied skill")
+
+    reward = ExecutionReward(agent_solve, skill_conditioned_adapter, cache, top_k=1, rng=random.Random(0))
+    skill = make_skill(title="install requests")
+
+    score = reward.score(skill, [matching_task])
+
+    assert score == 1.0 - 0.25  # V(skill-conditioned) - baseline
 
 
-def test_hybrid_reward_combines_quality_and_execution():
-    hybrid = HybridReward(quality_weight=0.5, execution_weight=0.5, alignment_weight=0.0)
-    quality = JudgeScore(dimensions={"a": 3}, dimension_maxes={"a": 3})  # overall 1.0
-    breakdown = hybrid.combine(quality, execution=0.5)
-
-    assert breakdown.quality_reward == 1.0
-    assert breakdown.execution_reward == 0.5
-    assert breakdown.total == 0.75
+def test_execution_reward_empty_pool_is_zero():
+    adapter = _FixedAdapter({})
+    cache = NoSkillBaselineCache(lambda d, s: SolveResult(success=True), adapter, n=4)
+    reward = ExecutionReward(lambda d, s: SolveResult(success=True), adapter, cache)
+    assert reward.score(make_skill(), []) == 0.0
 
 
-def test_hybrid_reward_includes_alignment_when_provided():
-    hybrid = HybridReward(quality_weight=0.5, execution_weight=0.3, alignment_weight=0.2)
-    quality = JudgeScore(dimensions={"a": 3}, dimension_maxes={"a": 3})
+def test_hybrid_reward_skill_output_multiplies_alignment_by_execution():
+    # Algorithm 1: R = lam*RQ + RA*RE for operations that produce a skill.
+    hybrid = HybridReward(lam=0.25)
+    quality = JudgeScore(dimensions={"a": 2}, dimension_maxes={"a": 4})  # overall 0.5
+    alignment = JudgeScore(dimensions={"a": 3}, dimension_maxes={"a": 3})  # overall 1.0
+
+    breakdown = hybrid.combine(quality, execution=0.6, alignment=alignment)
+
+    assert breakdown.total == 0.25 * 0.5 + 1.0 * 0.6
+
+
+def test_hybrid_reward_zero_alignment_gates_out_execution_credit():
+    hybrid = HybridReward(lam=0.25)
+    quality = JudgeScore(dimensions={"a": 4}, dimension_maxes={"a": 4})  # overall 1.0
     alignment = JudgeScore(dimensions={"a": 0}, dimension_maxes={"a": 3})  # overall 0.0
+
+    # Even a large execution reward earns nothing when alignment is zero --
+    # the agent's success wasn't attributable to this skill.
     breakdown = hybrid.combine(quality, execution=1.0, alignment=alignment)
 
-    assert breakdown.alignment_reward == 0.0
-    assert breakdown.total == 0.5 * 1.0 + 0.3 * 1.0 + 0.2 * 0.0
+    assert breakdown.total == 0.25 * 1.0
+
+
+def test_hybrid_reward_no_skill_output_uses_lam_dec_quality_only():
+    # Algorithm 1: R = lam_dec*RQ for add/drop/skip (no execution/alignment available).
+    hybrid = HybridReward(lam=0.25, lam_dec=0.4)
+    quality = JudgeScore(dimensions={"a": 3}, dimension_maxes={"a": 3})  # overall 1.0
+
+    breakdown = hybrid.combine(quality)
+
+    assert breakdown.execution_reward is None
+    assert breakdown.alignment_reward is None
+    assert breakdown.total == 0.4
+
+
+def test_hybrid_reward_lam_dec_defaults_to_lam():
+    hybrid = HybridReward(lam=0.25)
+    assert hybrid.lam_dec == 0.25

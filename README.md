@@ -2,34 +2,72 @@
 
 An implementation of the architecture described in **"CODESKILL: Learning
 Self-Evolving Skills for Coding Agents"** (Li, Zhang, Zhang, Liu, Liu;
-arXiv:2605.25430), using the paper's **actual appendix prompts**.
+arXiv:2605.25430), using the paper's **actual appendix prompts and reward
+formula**, verified directly against the primary PDF.
 
-## Prompt provenance
+## Verification status
 
-`codeskill/prompts.py` contains the nine system prompts from the paper's
-appendix, Figures 6-14 (pages 16-24): task-level extraction, event-driven
-extraction, skill evolution, skill-bank maintenance, and five rubric-judge
-prompts (task/event/evolution quality, merge quality, behavior alignment).
+This codebase went through two passes:
 
-**How they got here, honestly:** arxiv.org, huggingface.co,
-researchgate.net, and alphaxiv.org were all blocked by network egress
-policy in the environment this was written in, so these were not
-transcribed directly from the primary PDF by this codebase's author. They
-were pulled from the public `prompts/paper/` directory of a third-party
-reconstruction project, `rayyichen310/codeskill-rebuild`, whose
-`docs/REPRODUCTION_SPEC.md` states they are "faithful, line-normalized
-transcriptions" of the appendix and records a SHA-256 checksum of the
-source PDF it transcribed from. That's a reasonable chain of custody, but
-it is *not* independently verified byte-for-byte against the primary source
-here -- treat `codeskill/prompts.py`'s docstring citation as "best-effort
-reproduction," not "verified quote."
+1. **First pass** was built from the abstract plus a third-party
+   reconstruction project's (`rayyichen310/codeskill-rebuild`) public,
+   checksum-cited transcription of the appendix prompts -- arxiv.org,
+   huggingface.co, researchgate.net, and alphaxiv.org were all blocked by
+   network egress policy at the time, so the primary PDF wasn't
+   independently readable.
+2. **Second pass** read the actual paper PDF directly (supplied via a
+   connected Google Drive) and checked the implementation against it
+   line by line. Result:
+   - **Figures 6-14 (`codeskill/prompts.py`)**: confirmed verbatim-correct.
+     The third-party transcription the first pass relied on matched the
+     primary source exactly.
+   - **The reward formula (`codeskill/rewards.py`) was wrong** and has
+     since been fixed. See "Corrected against the paper" below.
+   - Two more paper details -- same-instance retrieval leakage filtering
+     and the real retrieval embedding model name -- were added/documented
+     from the verified text.
 
-Where the paper's own code, exact hyperparameters, retrieval embedding
-model, or reward weighting were never observed (the appendix gives the
-*prompts*, not the training or serving code), this repo makes a reasonable,
-clearly-documented engineering choice rather than guessing at unobserved
-specifics. Those choices are called out inline, in the module docstrings
-below.
+Where the paper's own code, exact hyperparameters not printed in its
+tables, or design choices below the level the appendix specifies were never
+observed, this repo makes a reasonable, clearly-documented engineering
+choice rather than guessing at unobserved specifics. Those choices are
+called out inline, in the module docstrings.
+
+## Corrected against the paper
+
+Reading the full PDF surfaced a real bug: `HybridReward` computed
+`quality_weight*RQ + execution_weight*RE + alignment_weight*RA` as three
+independently-weighted terms. The paper's actual formula (Section 3.3.2,
+Algorithm 1) is different in kind, not just in weights:
+
+```
+R(u; q) = lam * R_Q(u; q) + R_A(u; tau_u^pi) * R_E(u; x_u, pi)   # u produces an injectable skill (generate/evolve/merge)
+R(u; q) = lam_dec * R_Q(u; q)                                     # otherwise (add/drop/skip)
+```
+
+with **lam = 0.25** (Table 4's "Quality reward weight"). Alignment
+*multiplies* execution reward rather than being added alongside it -- it's
+a credit-assignment gate: a skill only earns execution credit when the
+agent's behavior is judged to actually reflect it, not merely correlate
+with task success. `lam_dec`'s exact value is referenced in Algorithm 1 but
+never given numerically anywhere in the paper; it defaults to `lam` here as
+a documented assumption. `codeskill/rewards.py`'s `HybridReward.combine()`
+now implements this exactly, and `ExecutionReward` was rewritten to match
+Algorithm 1's actual mechanic: a pre-cached no-skill baseline (average of
+**n=4** rollouts per task, Appendix B) and *reverse retrieval* --
+`x_u ~ TopK(s_u, D_task)`, ranking the task pool by the **skill's** content
+rather than a query -- instead of a plain pass-rate over a fixed eval set.
+
+Also added from the verified text: `SkillBank.retrieve()` now accepts
+`exclude_trajectory_ids` and `FrozenDownstreamAgent.attempt()` exposes it,
+implementing Appendix C's "skills generated from the same evaluation
+instance are filtered out to avoid same-instance leakage." `GRPOTrainer`'s
+`group_size`/`temperature` defaults (6, 0.7) now match Table 4's RL
+settings. The real retrieval encoder is confirmed as
+`sentence-transformers/all-MiniLM-L6-v2` with separate dense indexes per
+benchmark and skill granularity (Appendix C) -- this repo's own
+`SkillBank.retrieve()` still uses lexical Jaccard overlap as a
+dependency-free stand-in, now correctly cited rather than guessed at.
 
 ## Architecture
 
@@ -82,14 +120,29 @@ existing skill(s) ┌───────────────┐  │ Skill
   serialized into text) in `codeskill/extraction.py` -- the appendix
   specifies the system prompt and what the user message must contain, but
   not its exact layout.
-- **`HybridReward`'s quality/execution/alignment weighting** -- the
-  abstract describes combining dense rubric feedback with sparse execution
-  feedback; the exact weights were never observed and are a reasonable
-  default here, not a reported hyperparameter.
+- **`lam_dec`** in `HybridReward` -- Algorithm 1 references it for the
+  add/drop/skip branch but the paper never states a value distinct from
+  `lam`; it defaults to `lam` here as a documented assumption.
+- **Lexical (Jaccard) retrieval** in `SkillBank.retrieve()` /
+  `reverse_retrieve()` -- the paper uses dense embeddings via
+  `sentence-transformers/all-MiniLM-L6-v2` with per-benchmark,
+  per-granularity indexes (Appendix C); this repo uses a dependency-free
+  lexical stand-in instead, now correctly cited rather than guessed at.
+- The **online, per-instance streaming evaluation protocol** Appendix C
+  describes (collect a no-skill rollout on each incoming instance, extract
+  skills from it, maintain the bank, then solve that same instance with
+  everything already in the bank *except* its own just-extracted skills) is
+  not replicated by `codeskill/pipeline.py`, which instead builds the bank
+  from an offline trajectory batch and then evaluates baseline-vs-with-skills
+  as two separate passes over a benchmark. The same-instance-leakage
+  mechanism (`exclude_trajectory_ids`) is implemented and tested, but
+  wiring the full streaming loop end-to-end is left as an exercise.
 - The **GRPO training loop** (`codeskill/grpo.py`) and **SFT dataset
   builder** (`codeskill/sft_data.py`) are original scaffolding built to the
   paper's *description* of warm-start SFT + GRPO with hybrid reward --
-  correct in shape, not a port of the authors' training code.
+  correct in shape (including the group-relative advantage formula and
+  Table 4's group size/temperature/lambda), not a port of the authors'
+  training code or an implementation of the actual GRPO gradient step.
 
 ## Modules
 
@@ -118,8 +171,10 @@ existing skill(s) ┌───────────────┐  │ Skill
   policy is.
 - **`codeskill/rewards.py`** -- `TaskQualityJudge`, `EventQualityJudge`,
   `EvolutionQualityJudge`, `MergeQualityJudge`, `BehaviorAlignmentJudge`
-  (Fig 10-14), `ExecutionReward` (sparse pass-rate), and `HybridReward`
-  combining them.
+  (Fig 10-14); `NoSkillBaselineCache` + `ExecutionReward` (Algorithm 1's
+  pre-cached baseline and reverse-retrieval execution reward); and
+  `HybridReward`, implementing Algorithm 1's `R = lam*RQ + RA*RE` /
+  `R = lam_dec*RQ` combination rule exactly.
 - **`codeskill/eval/`** -- `BenchmarkAdapter` interface plus a fully-working
   synthetic `MockBenchmarkAdapter` for tests/demo. `env_bench_adapter()`,
   `swe_bench_verified_adapter()`, and `terminal_bench_2_adapter()` are
@@ -152,6 +207,26 @@ python -m codeskill.cli extract --trajectories examples/sample_trajectories.json
 python -m codeskill.cli build-sft --trajectories examples/sample_trajectories.json --out sft.jsonl --anthropic
 python -m codeskill.cli evaluate --bank bank.json
 ```
+
+## The paper's actual reported numbers
+
+For context, don't confuse these with anything this repo's own `demo`
+prints (that's a 3-example synthetic smoke test, not a benchmark result).
+The paper reports, with Qwen3.5-4B as the skill-manager backbone and
+Qwen3.5-35B-A3B as the frozen downstream coding policy (Table 1): average
+pass rate across EnvBench/SWE-Bench-Verified/Terminal-Bench-2 improves from
+29.57 (no-skill) to 39.26 (CODESKILL) -- a +9.69 absolute / ~33% relative
+gain -- and beats the strongest baseline (GPT-5.4-mini prompt-based skill
+management, 35.25) by +4.01. With GPT-5.4-mini as the frozen downstream
+policy instead, CODESKILL still wins: 21.80 -> 30.73 average pass rate.
+Full lifecycle maintenance (add/merge/drop) shrinks the skill bank from
+1252 skills (extraction only) to 676 while costing only ~2% average pass
+rate -- the compaction the abstract calls "stable size."
+
+Training used a 3-phase curriculum (extraction-only, +evolution,
++maintenance; 130/120/250 GRPO steps respectively, 500 total) over
+trajectories from SWE-Bench Verified, SWE-smith, and EnvBench, with
+GPT-5.4-mini as the SFT teacher and RL judge.
 
 ## Plugging in real benchmarks
 

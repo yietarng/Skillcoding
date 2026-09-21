@@ -1,12 +1,14 @@
 """The hybrid reward: dense rubric-judge quality scores + sparse execution
 feedback, matching the paper's five appendix judge prompts (Figures 10-14,
-see `codeskill/prompts.py`) plus a verifiable pass/fail signal from the
-frozen downstream agent.
+see `codeskill/prompts.py`) and Section 3.3.2 / Algorithm 1's reward formula,
+now verified against the primary PDF (not just a third-party transcription).
 
 Each judge prompt asks the *judge LLM itself* to count yes-answers per
 dimension and emit the resulting integer score directly (not raw yes/no
 answers for us to tally) -- so `JudgeScore.overall()` just normalizes the
-returned per-dimension integers by their stated max.
+returned per-dimension integers by their stated max, matching the paper's
+"number of satisfied yes/no questions divided by total number of yes/no
+questions in the rubric" (Appendix B).
 
 - `TaskQualityJudge` / `EventQualityJudge` -- score a freshly extracted
   candidate skill against the trajectory evidence it came from (Fig 10/11).
@@ -15,18 +17,24 @@ returned per-dimension integers by their stated max.
 - `MergeQualityJudge` -- score a proposed merge purely on skill text, no
   trajectory (Fig 13).
 - `BehaviorAlignmentJudge` -- score whether a downstream rollout actually
-  reflects the provided skill, not just competent behavior (Fig 14). This
-  is the "behavior-skill alignment" signal the paper's abstract references.
-- `ExecutionReward` -- sparse, verifiable: the frozen downstream agent's
-  pass rate on held-out tasks.
+  reflects the provided skill, not just competent behavior (Fig 14).
+- `NoSkillBaselineCache` / `ExecutionReward` -- Algorithm 1's pre-cached
+  no-skill baseline (average of `n` no-skill rollouts per task) and the
+  reverse-retrieval execution reward `V(skill-conditioned rollout) - baseline`.
+- `HybridReward` -- Algorithm 1's exact combination rule, not an
+  independently-weighted sum (see its docstring for the formula and why an
+  earlier version of this file got it wrong).
 """
 from __future__ import annotations
 
 import json
+import random
+import statistics
 from dataclasses import dataclass
 from typing import Optional
 
-from codeskill.downstream_agent import FrozenDownstreamAgent
+from codeskill.downstream_agent import SolveFn
+from codeskill.eval.harness import BenchmarkAdapter, BenchmarkTask
 from codeskill.extraction import format_skill_ref, format_trajectory
 from codeskill.llm import LLMClient, extract_json
 from codeskill.prompts import (
@@ -167,19 +175,89 @@ class BehaviorAlignmentJudge(_RubricJudge):
         return self._score_from_raw(raw)
 
 
-class ExecutionReward:
-    """Runs the frozen downstream agent on a fixed set of held-out tasks and
-    reports the pass rate: the sparse, verifiable half of the hybrid reward."""
+class NoSkillBaselineCache:
+    """Algorithm 1, lines 1-4: `b_pi(x) = (1/n) * sum_i V(tau_0_i(x))`.
 
-    def __init__(self, agent: FrozenDownstreamAgent, eval_tasks: list[str]):
-        self.agent = agent
-        self.eval_tasks = eval_tasks
+    Precomputes and caches, per task, the average verifier score over `n`
+    no-skill rollouts (the paper uses n=4, Appendix B). Cached so the same
+    baseline is reused however many times different candidate skills'
+    reverse retrieval lands on that task.
+    """
 
-    def score(self) -> float:
-        if not self.eval_tasks:
+    def __init__(self, no_skill_solve_fn: SolveFn, adapter: BenchmarkAdapter, n: int = 4):
+        self.no_skill_solve_fn = no_skill_solve_fn
+        self.adapter = adapter
+        self.n = n
+        self._cache: dict[str, float] = {}
+
+    def baseline(self, task: BenchmarkTask) -> float:
+        if task.task_id not in self._cache:
+            scores = []
+            for _ in range(self.n):
+                result = self.no_skill_solve_fn(task.description, [])
+                scores.append(1.0 if self.adapter.verify(task, result) else 0.0)
+            self._cache[task.task_id] = statistics.fmean(scores)
+        return self._cache[task.task_id]
+
+
+def _skill_query_text(skill: Skill) -> str:
+    return " ".join([skill.title, skill.when_to_apply, *skill.rules])
+
+
+def _tokenize(text: str) -> set[str]:
+    return {t.strip(".,:;()[]{}").lower() for t in text.split() if len(t) > 2}
+
+
+def reverse_retrieve(skill: Skill, task_pool: list[BenchmarkTask], top_k: int = 5) -> list[BenchmarkTask]:
+    """`x_u ~ TopK(s_u, D_task)`: rank the task pool by lexical overlap with
+    the *skill's* content (title/when_to_apply/rules) rather than the usual
+    task-queries-skills direction -- this is what makes it "reverse"
+    retrieval. Stands in for the paper's dense-embedding retrieval (it uses
+    `sentence-transformers/all-MiniLM-L6-v2`, Appendix C); swap in a real
+    embedding scorer for production use.
+    """
+    skill_tokens = _tokenize(_skill_query_text(skill))
+
+    def score(task: BenchmarkTask) -> float:
+        task_tokens = _tokenize(task.description)
+        if not skill_tokens or not task_tokens:
             return 0.0
-        results = [self.agent.attempt(t, record_usage=False) for t in self.eval_tasks]
-        return sum(1.0 for r in results if r.success) / len(results)
+        return len(skill_tokens & task_tokens) / len(skill_tokens | task_tokens)
+
+    ranked = sorted(task_pool, key=score, reverse=True)
+    return ranked[:top_k]
+
+
+class ExecutionReward:
+    """Algorithm 1, lines 9-12: `R_E(u; x_u, pi) = V(tau_u_pi) - b_pi(x_u)`,
+    where `x_u` is chosen by reverse retrieval over a task pool, not a fixed
+    per-run eval set averaged into a pass rate (an earlier version of this
+    file did the latter, which is not what the paper describes).
+    """
+
+    def __init__(
+        self,
+        agent_solve_fn: SolveFn,
+        adapter: BenchmarkAdapter,
+        baseline_cache: NoSkillBaselineCache,
+        top_k: int = 5,
+        rng: Optional[random.Random] = None,
+    ):
+        self.agent_solve_fn = agent_solve_fn
+        self.adapter = adapter
+        self.baseline_cache = baseline_cache
+        self.top_k = top_k
+        self.rng = rng or random.Random()
+
+    def score(self, skill: Skill, task_pool: list[BenchmarkTask]) -> float:
+        candidates = reverse_retrieve(skill, task_pool, top_k=self.top_k)
+        if not candidates:
+            return 0.0
+        task = self.rng.choice(candidates)
+        baseline = self.baseline_cache.baseline(task)
+        result = self.agent_solve_fn(task.description, [skill])
+        verified = 1.0 if self.adapter.verify(task, result) else 0.0
+        return verified - baseline
 
 
 @dataclass
@@ -193,33 +271,38 @@ class RewardBreakdown:
 
 
 class HybridReward:
-    """Combines a stage-appropriate quality `JudgeScore` with the sparse
-    execution pass rate and (optionally) a behavior-alignment `JudgeScore`.
+    """Section 3.3.2 / Algorithm 1's exact reward combination:
 
-    The paper's abstract describes "a hybrid reward that combines dense
-    rubric-based skill-quality feedback with sparse verifiable execution
-    feedback from the frozen downstream agent" -- the exact weighting
-    between the two is not given in what was accessible of the paper, so
-    the defaults here are a reasonable choice, not a reproduction of a
-    reported hyperparameter.
+        R(u; q) = lam * R_Q(u; q) + R_A(u; tau_u_pi) * R_E(u; x_u, pi)   if u produces an injectable skill
+        R(u; q) = lam_dec * R_Q(u; q)                                    otherwise (add / drop / skip)
+
+    `lam = 0.25` is the paper's own reported value ("Quality reward weight
+    lambda", Table 4). Note this is *not* three independently-weighted
+    terms summed together -- alignment multiplies execution reward, acting
+    as a credit-assignment gate (a skill only gets execution credit when the
+    agent's behavior actually reflects it), rather than being an additive
+    bonus on top. `lam_dec` (the weight for skip/add/drop operations, which
+    never reach a skill-conditioned rollout) is referenced in Algorithm 1
+    but no distinct numeric value is given anywhere the paper makes
+    accessible; it defaults to the same value as `lam` here as a documented
+    assumption, not a reported hyperparameter.
     """
 
-    def __init__(self, quality_weight: float = 0.5, execution_weight: float = 0.4, alignment_weight: float = 0.1):
-        self.quality_weight = quality_weight
-        self.execution_weight = execution_weight
-        self.alignment_weight = alignment_weight
+    def __init__(self, lam: float = 0.25, lam_dec: Optional[float] = None):
+        self.lam = lam
+        self.lam_dec = lam_dec if lam_dec is not None else lam
 
     def combine(
         self,
         quality: JudgeScore,
+        *,
         execution: Optional[float] = None,
         alignment: Optional[JudgeScore] = None,
     ) -> RewardBreakdown:
-        total = self.quality_weight * quality.overall()
-        if execution is not None:
-            total += self.execution_weight * execution
-        if alignment is not None:
-            total += self.alignment_weight * alignment.overall()
+        if execution is not None and alignment is not None:
+            total = self.lam * quality.overall() + alignment.overall() * execution
+        else:
+            total = self.lam_dec * quality.overall()
         return RewardBreakdown(
             quality_reward=quality.overall(),
             execution_reward=execution,

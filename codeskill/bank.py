@@ -129,19 +129,32 @@ class SkillBank:
         query: str,
         top_k: int = 5,
         granularity: Optional[Granularity] = None,
+        exclude_trajectory_ids: Optional[set[str]] = None,
     ) -> list[RetrievalResult]:
         """Rank active skills by lexical overlap with `query`.
 
         Deliberately dependency-free (no embedding model required) so the
-        bank is usable offline; the paper mentions a MiniLM-based retrieval
-        setup (per the reconstruction notes) -- swap in a real
+        bank is usable offline; the paper (Appendix C) encodes retrieval
+        documents built from a skill's title/when_to_apply/rules with
+        `sentence-transformers/all-MiniLM-L6-v2` and builds separate dense
+        indexes per benchmark and skill granularity -- swap in a real
         embedding-similarity scorer by subclassing and overriding this
         method for production use.
+
+        `exclude_trajectory_ids`, when given, drops any skill whose
+        provenance traces back to one of those trajectories -- the same
+        "skills generated from the same evaluation instance are filtered
+        out to avoid same-instance leakage" rule Appendix C describes for
+        retrieval at task-solving time.
         """
         query_tokens = self._tokenize(query)
         candidates = self.active_skills()
         if granularity is not None:
             candidates = [s for s in candidates if s.granularity == granularity]
+        if exclude_trajectory_ids:
+            candidates = [
+                s for s in candidates if not any(p.trajectory_id in exclude_trajectory_ids for p in s.provenance)
+            ]
 
         scored: list[RetrievalResult] = []
         for skill in candidates:
