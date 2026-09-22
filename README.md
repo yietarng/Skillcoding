@@ -69,6 +69,33 @@ benchmark and skill granularity (Appendix C) -- this repo's own
 `SkillBank.retrieve()` still uses lexical Jaccard overlap as a
 dependency-free stand-in, now correctly cited rather than guessed at.
 
+Two later passes over the same verified text found two more real gaps,
+since fixed: `SkillManagerPolicy.process_evolution` was writing a revision
+straight to the bank instead of routing it through the maintenance stage
+like extraction does ("each newly extracted or evolved candidate skill is
+further passed to a maintenance stage" -- Section 3.2, repeated in
+Appendix C); and `FrozenDownstreamAgent.attempt()` retrieved both skill
+granularities from one pooled `top_k` budget instead of "separate
+retrieval indexes for task-level and event-driven skills" (Appendix C).
+See the Architecture section and this codebase's own git history for the
+details of both fixes.
+
+## Gaps in the paper itself
+
+Not everything unclear here is this codebase's doing. Appendix B states
+the five appendix judge prompts (Figures 10-14) are "*representative*
+judge templates" for five *categories* -- task-level extraction,
+event-driven extraction, skill evolution, **skill-bank maintenance**, and
+behavior alignment -- and Figure 13 shows only maintenance's `merge`
+sub-case. Algorithm 1 computes a quality reward `R_Q` unconditionally for
+*every* sampled operation (line 8, before it branches on whether a skill
+exists), which would include bare `add`/`drop` maintenance decisions too.
+The paper's own wording implies the authors likely used similarly-styled
+judges for those sub-cases without printing them. No `AddQualityJudge` or
+`DropQualityJudge` is fabricated here to fill that gap -- `codeskill/rewards.py`
+implements exactly the five judges the paper actually shows, and says so
+in its own docstring, rather than guessing at unpublished prompts.
+
 ## Architecture
 
 The appendix specifies four manager-policy stages, each its own prompt --

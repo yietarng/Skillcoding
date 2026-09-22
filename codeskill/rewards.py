@@ -18,6 +18,23 @@ questions in the rubric" (Appendix B).
   trajectory (Fig 13).
 - `BehaviorAlignmentJudge` -- score whether a downstream rollout actually
   reflects the provided skill, not just competent behavior (Fig 14).
+
+  Gap in the paper, not this implementation: Appendix B says it designs
+  "action-specific judge prompts for task-level extraction, event-driven
+  extraction, skill evolution, skill-bank maintenance, and behavior
+  alignment" -- five *categories* -- and that "representative judge
+  templates are provided in Figures 10-14." Figure 13 shows only
+  maintenance's `merge` sub-case; Algorithm 1 still computes a quality
+  reward `R_Q` unconditionally for every sampled operation (line 8, before
+  branching on whether a skill exists), which would include bare `add`/
+  `drop` maintenance decisions too. The wording "representative" implies
+  the authors likely used similarly-styled (but unpublished) judges for
+  those sub-cases. No such prompt is given anywhere in the paper this was
+  checked against, so none is fabricated here -- there is no
+  `AddQualityJudge`/`DropQualityJudge`. A caller who samples bare `add`/
+  `drop` maintenance decisions during RL and needs a quality score for them
+  has to design that judge themselves; `HybridReward.combine(quality)`
+  still works once they have one.
 - `NoSkillBaselineCache` / `ExecutionReward` -- Algorithm 1's pre-cached
   no-skill baseline (average of `n` no-skill rollouts per task) and the
   reverse-retrieval execution reward `V(skill-conditioned rollout) - baseline`.
